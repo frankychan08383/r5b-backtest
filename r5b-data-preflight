@@ -1,0 +1,561 @@
+name: R5B 2023 source preflight
+
+# Manual launch only. This is a DATA check, not a strategy backtest.
+'on':
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: r5b-source-preflight-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  public-data-check:
+    # Refuse to run in private repositories. Do not upload any private holdings.
+    if: ${{ github.event.repository.private == false }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PYTHONUNBUFFERED: '1'
+      HF_HUB_DISABLE_TELEMETRY: '1'
+    steps:
+      - name: Initialize evidence directory
+        shell: bash
+        run: |
+          mkdir -p r5b_source_results
+          printf '%s\n' 'Source preflight only. No strategy returns. No orders. No private HF token.' > r5b_source_results/READ_FIRST.txt
+          printf '%s\n' "$GITHUB_RUN_ID" > r5b_source_results/GITHUB_RUN_ID.txt
+          python3 --version > r5b_source_results/python_version.txt
+
+      - name: Install pinned public parsers and vendor client
+        timeout-minutes: 6
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/r5b-env"
+          "$RUNNER_TEMP/r5b-env/bin/python" -m pip install --disable-pip-version-check pyarrow==22.0.0 baostock==0.9.3 pandas==2.2.3 2>&1 | tee r5b_source_results/dependency_install.log
+          "$RUNNER_TEMP/r5b-env/bin/python" -m pip freeze > r5b_source_results/dependencies_resolved.txt
+          echo "R5B_PY=$RUNNER_TEMP/r5b-env/bin/python" >> "$GITHUB_ENV"
+
+      - name: Materialize reviewed preflight code
+        shell: bash
+        run: |
+          cat > r5b_preflight.py <<'R5B_PYTHON_EOF'
+          #!/usr/bin/env python3
+          """Public-data acquisition preflight. No orders, credentials, or backtest returns.
+          
+          Defaults to a bounded, availability-only probe. The selected files are NOT an
+          investment sample and must never be described as a full-A-share backtest.
+          """
+          from __future__ import annotations
+          import argparse
+          import collections
+          import csv
+          import datetime as dt
+          import gzip
+          import hashlib
+          import io
+          import json
+          import math
+          import os
+          from pathlib import Path
+          import re
+          import socket
+          import subprocess
+          import sys
+          import time
+          import urllib.parse
+          import urllib.request
+          
+          VERSION = 'R5B-STAGE-A-SOURCE-PREFLIGHT-20260918'
+          REPOS = ('jobs-git/StockChina-Minute', 'perctrix/StockChina-Minute',
+                   'q1232990/StockChina-Minute-Parquet',
+                   'neigezhu/china-a-share-1min-ohlcv')
+          R4_SHA = '39377668065d6abe8d9a8115603452bd83cae7eb91a920deca824eb6fb109b3b'
+          MIB = 1024 * 1024
+          
+          
+          def digest(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for b in iter(lambda: f.read(MIB), b''):
+                      h.update(b)
+              return h.hexdigest()
+          
+          
+          def write_json(path: Path, obj) -> None:
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(json.dumps(obj, indent=2, ensure_ascii=False, allow_nan=False,
+                                         default=str) + '\n', encoding='utf-8')
+          
+          
+          def clean_name(value: str) -> str:
+              return re.sub(r'[^A-Za-z0-9_.-]', '_', value)
+          
+          
+          def file_url(repo: str, sha: str, path: str) -> str:
+              if repo not in REPOS or not re.fullmatch(r'[0-9a-f]{40}', sha):
+                  raise ValueError('Unapproved repository or unpinned revision')
+              if path.startswith('/') or '..' in Path(path).parts or '\\' in path:
+                  raise ValueError('Unsafe repository path')
+              return ('https://huggingface.co/datasets/' + repo + '/resolve/' + sha + '/' +
+                      urllib.parse.quote(path, safe='/'))
+          
+          
+          class PublicHTTP:
+              def __init__(self, out: Path, byte_budget: int = 600 * MIB,
+                           wall_seconds: int = 1080):
+                  self.out = out
+                  self.used = 0
+                  self.limit = byte_budget
+                  self.deadline = time.monotonic() + wall_seconds
+                  self.records = []
+          
+              def fetch(self, url: str, dest: Path, max_bytes: int = 160 * MIB) -> dict:
+                  # No account token or authorization header is ever read or sent.
+                  if not url.startswith('https://huggingface.co/'):
+                      raise ValueError('Only whitelisted public HF endpoints are fetched')
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  tmp = dest.with_name(dest.name + '.part')
+                  record = {'url': url, 'status': 'FAILED', 'bytes': 0}
+                  n = 0
+                  try:
+                      if time.monotonic() >= self.deadline:
+                          raise TimeoutError('Run wall-time budget exhausted')
+                      req = urllib.request.Request(url, headers={
+                          'User-Agent': VERSION, 'Accept-Encoding': 'identity'})
+                      with urllib.request.urlopen(req, timeout=25) as response:
+                          record['http_status'] = response.status
+                          if response.status != 200:
+                              raise ValueError('Whole-file fetch requires HTTP 200')
+                          length = response.headers.get('Content-Length')
+                          expected = int(length) if length is not None else None
+                          if expected is not None and expected > min(max_bytes, self.limit-self.used):
+                              raise ValueError('Declared body exceeds bounded download budget')
+                          with tmp.open('wb') as f:
+                              while True:
+                                  if time.monotonic() >= self.deadline:
+                                      raise TimeoutError('Run wall-time budget exhausted')
+                                  chunk = response.read(MIB)
+                                  if not chunk:
+                                      break
+                                  n += len(chunk)
+                                  self.used += len(chunk)
+                                  if n > max_bytes or self.used > self.limit:
+                                      raise ValueError('Observed body exceeds download budget')
+                                  f.write(chunk)
+                          if n == 0 or (expected is not None and n != expected):
+                              raise ValueError('Empty or incomplete HTTP body')
+                      tmp.replace(dest)
+                      record.update(status='DOWNLOADED', bytes=n,
+                                    sha256=digest(dest), path=str(dest.relative_to(self.out)))
+                  except Exception as e:
+                      tmp.unlink(missing_ok=True)
+                      record.update(bytes=n, error=type(e).__name__ + ': ' + str(e)[:500])
+                  self.records.append(record)
+                  write_json(self.out/'http_log.json', self.records)
+                  return record
+          
+          
+          def classify(path: str) -> str:
+              m = re.fullmatch(r'data/stock_1m/(SH|SZ|BJ)/(\d{6})\.parquet', path)
+              if m:
+                  ex, code = m.groups()
+              else:
+                  m = re.fullmatch(r'(\d{6})\.(XSHE|XSHG)\.(csv|parquet)', path)
+                  if not m:
+                      return 'NOT_CANONICAL_SECURITY_FILE'
+                  code, suffix, _ = m.groups()
+                  ex = {'XSHE': 'SZ', 'XSHG': 'SH'}[suffix]
+              if ex == 'BJ': return 'BJ'
+              if ex == 'SH' and code.startswith('688'): return 'STAR'
+              if ex == 'SZ' and code.startswith(('300', '301')): return 'CHINEXT'
+              if ex == 'SH' and code.startswith(('600', '601', '603', '605')): return 'SH_MAIN'
+              if ex == 'SZ' and code.startswith(('000', '001', '002', '003')): return 'SZ_MAIN'
+              return 'OTHER_REQUIRES_IDENTITY_CHECK'
+          
+          
+          def inventory(http: PublicHTTP, repo: str, out: Path) -> dict:
+              # HF repo-info endpoint returns sha and siblings; bytes are retained.
+              p = out/'metadata'/(clean_name(repo) + '.repo.json')
+              rec = http.fetch('https://huggingface.co/api/datasets/' + repo + '/revision/main',
+                               p, 16 * MIB)
+              if rec['status'] != 'DOWNLOADED':
+                  return {'repo': repo, 'status': 'METADATA_UNAVAILABLE', 'error': rec.get('error')}
+              data = json.loads(p.read_text(encoding='utf-8'))
+              sha = data.get('sha', '')
+              siblings = data.get('siblings')
+              if not re.fullmatch(r'[0-9a-f]{40}', sha) or not isinstance(siblings, list):
+                  return {'repo': repo, 'status': 'METADATA_SCHEMA_FAILED'}
+              paths = [item['rfilename'] for item in siblings
+                       if isinstance(item, dict) and isinstance(item.get('rfilename'), str)]
+              if len(paths) != len(set(paths)):
+                  return {'repo': repo, 'status': 'DUPLICATE_PATH_INVENTORY'}
+              security = [x for x in paths if classify(x) != 'NOT_CANONICAL_SECURITY_FILE']
+              counts = dict(collections.Counter(classify(x) for x in security))
+              result = {'repo': repo, 'sha': sha, 'status': 'INVENTORY_RECEIVED',
+                        'listed_file_count': len(paths), 'canonical_security_files': len(security),
+                        'board_filename_counts_NOT_PIT': counts, 'paths': paths,
+                        'official_historical_universe_certified': False}
+              write_json(out/'metadata'/(clean_name(repo) + '.inventory.json'), result)
+              return result
+          
+          
+          def select_probes(inv: dict) -> list[str]:
+              paths = set(inv.get('paths', []))
+              if inv['repo'] == REPOS[-1]:
+                  wanted = ['data/stock_1m/SH/600000.parquet',
+                            'data/stock_1m/SZ/000001.parquet',
+                            'data/stock_1m/SZ/300001.parquet',
+                            'data/stock_1m/SH/688001.parquet']
+                  # Availability probe, not a selected trading universe. Missing paths stay missing.
+                  bj = sorted(x for x in paths if classify(x) == 'BJ')
+                  wanted += bj[:1]
+                  return wanted
+              return ['000001.XSHE.' + ('parquet' if 'Parquet' in inv['repo'] else 'csv')]
+          
+          
+          def parse_stamp(value) -> dt.datetime:
+              if isinstance(value, dt.datetime):
+                  result = value
+              else:
+                  text = str(value).strip()
+                  result = dt.datetime.fromisoformat(text.replace('Z', '+00:00'))
+              if result.tzinfo is not None:
+                  # Never silently convert a provider's timestamp contract.
+                  raise ValueError('Timezone-bearing stamp requires explicit source adapter')
+              return result
+          
+          
+          def number(value):
+              if value is None or str(value).strip().lower() in ('', 'nan', 'null', 'none', '<na>'):
+                  return None
+              result = float(value)
+              return result if math.isfinite(result) else None
+          
+          
+          def reference_semantics(rows: list[dict]) -> dict:
+              daily = collections.defaultdict(set)
+              pairs = matches = 0
+              prev = None
+              for row in rows:
+                  stamp = parse_stamp(row['timestamp'])
+                  pre, close = number(row.get('pre_close')), number(row.get('close'))
+                  if pre is not None:
+                      daily[stamp.date().isoformat()].add(round(pre, 6))
+                  if prev and stamp.date() == prev[0].date() and pre is not None and prev[1] is not None:
+                      pairs += 1
+                      matches += int(abs(pre-prev[1]) <= 0.0001)
+                  prev = (stamp, close)
+              maximum = max((len(v) for v in daily.values()), default=0)
+              status = ('NO_REFERENCE_VALUES' if maximum == 0 else
+                        'CHANGES_INTRADAY_REJECT_AS_DAILY_REFERENCE' if maximum > 1 else
+                        'CONSTANT_IN_SAMPLE_NOT_CERTIFIED')
+              return {'status': status, 'sample_rows': len(rows),
+                      'maximum_distinct_pre_close_per_day': maximum,
+                      'previous_bar_comparisons': pairs, 'previous_bar_matches': matches,
+                      'previous_bar_match_fraction': matches/pairs if pairs else None,
+                      'daily_reference_certified': False}
+          
+          
+          def rows_from_file(path: Path):
+              if path.suffix == '.csv':
+                  with path.open('r', encoding='utf-8-sig', newline='') as f:
+                      yield from csv.DictReader(f)
+              else:
+                  import pyarrow.parquet as pq
+                  source = pq.ParquetFile(path)
+                  for batch in source.iter_batches(batch_size=16384):
+                      yield from batch.to_pylist()
+          
+          
+          def inspect_file(path: Path, target_year: int, out_stem: Path) -> dict:
+              counts = collections.Counter()
+              daily = {}
+              semantics = []
+              head, tail = [], collections.deque(maxlen=3)
+              n = target = invalid = unsorted = dup = price_invalid = zero_volume = volume_invalid = 0
+              minimum = maximum = prev = None
+              fields = None
+              time_key = None
+              export_path = Path(str(out_stem) + '.target.csv.gz')
+              export_path.parent.mkdir(parents=True, exist_ok=True)
+              with gzip.open(export_path, 'wt', encoding='utf-8', newline='') as out:
+                  writer = None
+                  for row in rows_from_file(path):
+                      if fields is None:
+                          fields = list(row)
+                          time_key = next((key for key in ('timestamp','datetime','date_time',
+                                            'Unnamed: 0','') if key in row), None)
+                          if time_key is None:
+                              raise ValueError('No recognized timestamp field; do not guess column meanings')
+                          writer = csv.DictWriter(out, fieldnames=fields)
+                          writer.writeheader()
+                      n += 1
+                      if len(head) < 3: head.append(row)
+                      tail.append(row)
+                      try:
+                          ts = parse_stamp(row[time_key])
+                      except (TypeError, ValueError):
+                          invalid += 1
+                          continue  # Explicitly counted as invalid, never as a no-signal observation.
+                      minimum = ts if minimum is None else min(minimum, ts)
+                      maximum = ts if maximum is None else max(maximum, ts)
+                      if prev is not None:
+                          unsorted += int(ts < prev)
+                          dup += int(ts == prev)  # All-key uniqueness still needs a full independent check.
+                      prev = ts
+                      counts[ts.year] += 1
+                      if len(semantics) < 2048:
+                          semantics.append({'timestamp': ts, 'pre_close': row.get('pre_close'),
+                                            'close': row.get('close')})
+                      if ts.year != target_year:
+                          continue
+                      target += 1
+                      writer.writerow(row)
+                      values = [number(row.get(k)) for k in ('open','high','low','close')]
+                      o,h,l,c = values
+                      vol = number(row.get('volume'))
+                      price_invalid += int(any(x is None or x <= 0 for x in values) or
+                                           (all(x is not None for x in values) and
+                                            not (l <= min(o,c) <= max(o,c) <= h)))
+                      zero_volume += int(vol == 0)
+                      volume_invalid += int(vol is None or vol < 0)
+                      day = ts.date().isoformat()
+                      if day not in daily:
+                          daily[day] = {'date': day, 'rows': 0, 'first_label': str(ts),
+                                        'last_label': str(ts), 'open': o, 'high': h,
+                                        'low': l, 'close': c}
+                      d = daily[day]
+                      d['rows'] += 1
+                      d['last_label'], d['close'] = str(ts), c
+                      if h is not None: d['high'] = max(d['high'],h) if d['high'] is not None else h
+                      if l is not None: d['low'] = min(d['low'],l) if d['low'] is not None else l
+              if n == 0:
+                  raise ValueError('Empty input is not a valid no-signal file')
+              result = {'rows_scanned': n, 'earliest': minimum, 'latest': maximum,
+                        'rows_by_year': dict(sorted(counts.items())), 'target_year': target_year,
+                        'target_year_rows': target, 'target_observed_days': len(daily),
+                        'invalid_timestamps': invalid, 'backward_timestamps': unsorted,
+                        'adjacent_duplicate_timestamps': dup, 'invalid_target_ohlc': price_invalid,
+                        'zero_volume_target_rows': zero_volume, 'invalid_target_volume_rows': volume_invalid, 'schema': fields,
+                        'observed_timestamp_field': time_key, 'timestamp_start_end_contract': 'UNVERIFIED',
+                        'source_pre_close_semantics_FIRST_2048_ONLY': reference_semantics(semantics),
+                        'target_export': export_path.name, 'full_market_coverage': 'UNKNOWN',
+                        'backtest_run': False, 'observed_file_format_checks_passed': bool(minimum is not None and not (invalid or unsorted or dup or price_invalid or volume_invalid)),
+                        'head': head, 'tail': list(tail)}
+              if daily:
+                  daily_path = Path(str(out_stem) + '.daily.csv')
+                  with daily_path.open('w',encoding='utf-8',newline='') as f:
+                      writer=csv.DictWriter(f,fieldnames=list(next(iter(daily.values()))))
+                      writer.writeheader();writer.writerows(daily.values())
+              write_json(Path(str(out_stem) + '.audit.json'), result)
+              return result
+          
+          
+          def baostock_probe(out: Path, year: int):
+              """Bounded sequential vendor bridge pilot, not an official historical PIT universe."""
+              socket.setdefaulttimeout(15)
+              import baostock as bs
+              out.mkdir(parents=True,exist_ok=True)
+              status = {'status':'FAILED', 'universe_scope':'THREE_DATES_ONLY_NOT_FULL_PIT',
+                        'queries':[], 'official_pit_certified':False}
+              def save(rs, stem):
+                  if str(rs.error_code) != '0':
+                      raise RuntimeError(str(rs.error_code)+': '+str(rs.error_msg))
+                  rows=[]
+                  while rs.next():
+                      if str(rs.error_code) != '0':
+                          raise RuntimeError('Error during result pagination')
+                      rows.append(rs.get_row_data())
+                  if str(rs.error_code) != '0':
+                      raise RuntimeError('Error at result completion')
+                  with (out/(stem+'.csv')).open('w',encoding='utf-8',newline='') as f:
+                      w=csv.writer(f);w.writerow(rs.fields);w.writerows(rows)
+                  status['queries'].append({'name':stem,'rows':len(rows),'fields':rs.fields})
+                  write_json(out/'status.json',status)
+                  return [dict(zip(rs.fields,r)) for r in rows]
+              try:
+                  login=bs.login()
+                  if str(login.error_code)!='0': raise RuntimeError(str(login.error_msg))
+                  cal=save(bs.query_trade_dates(start_date=f'{year}-01-01',end_date=f'{year}-12-31'),'calendar')
+                  days=[r['calendar_date'] for r in cal if str(r.get('is_trading_day'))=='1']
+                  if not days: raise ValueError('Vendor returned no trading days')
+                  for d in (days[0],days[len(days)//2],days[-1]):
+                      save(bs.query_all_stock(day=d),'universe_'+d)
+                  save(bs.query_stock_basic(),'stock_basic_CURRENT_VENDOR_SNAPSHOT')
+                  fields='date,code,open,high,low,close,preclose,volume,amount,adjustflag,turn,tradestatus,pctChg,isST'
+                  for symbol in ('sh.600000','sz.000001','sz.300001','sh.688001'):
+                      save(bs.query_history_k_data_plus(symbol,fields,start_date=f'{year-1}-12-01',
+                           end_date=f'{year+1}-01-15',frequency='d',adjustflag='3'),'daily_'+symbol)
+                      time.sleep(0.25)
+                  status['status']='VENDOR_PILOT_RETRIEVED_NOT_CERTIFIED'
+              except Exception as e:
+                  status['error']=type(e).__name__+': '+str(e)
+              finally:
+                  write_json(out/'status.json',status)
+                  try: bs.logout()
+                  except Exception: pass
+              return status
+          
+          
+          def compare_daily_bridges(out: Path) -> list[dict]:
+              rows=[]
+              for code,ex in [('600000','SH'),('000001','SZ'),('300001','SZ'),('688001','SH')]:
+                  stem=clean_name(REPOS[-1]+'__'+f'data/stock_1m/{ex}/{code}.parquet')
+                  minute=out/'audits'/(stem+'.daily.csv')
+                  daily=out/'baostock'/('daily_'+ex.lower()+'.'+code+'.csv')
+                  if not minute.exists() or not daily.exists(): continue
+                  with daily.open(encoding='utf-8') as f:
+                      vendor={r['date']:r for r in csv.DictReader(f)}
+                  with minute.open(encoding='utf-8') as f:
+                      for m in csv.DictReader(f):
+                          row={'code':code,'date':m['date'],'minute_rows':m['rows'],
+                               'daily_vendor_present':m['date'] in vendor,
+                               'official_limits_certified':False}
+                          if m['date'] in vendor:
+                              d=vendor[m['date']]
+                              for field in ('open','high','low','close'):
+                                  a,b=number(m.get(field)),number(d.get(field))
+                                  row[field+'_delta']=a-b if a is not None and b is not None else None
+                              row['vendor_preclose']=d.get('preclose')
+                              row['vendor_isST']=d.get('isST')
+                              row['vendor_tradestatus']=d.get('tradestatus')
+                              row['ohlc_all_within_0_0001']=all(row[k+'_delta'] is not None and
+                                   abs(row[k+'_delta'])<=0.0001 for k in ('open','high','low','close'))
+                          rows.append(row)
+              write_json(out/'price_basis_bridge_PILOT_ONLY.json',rows)
+              return rows
+          
+          
+          def finish(out: Path, inventories, probes, http):
+              summary={'version':VERSION,'frozen_R4_engine_sha256':R4_SHA,
+                       'github_run_id':os.environ.get('GITHUB_RUN_ID'),
+                       'timestamp_utc':dt.datetime.now(dt.timezone.utc).isoformat(),
+                       'inventories':[{k:v for k,v in x.items() if k!='paths'} for x in inventories],
+                       'probes':probes,'download_bytes':http.used,'full_A_backtest_started':False,
+                       'historical_strategy_trades':0,'order_permission':0,
+                       'status':'SOURCE_PREFLIGHT_ONLY_NOT_STRATEGY_BACKTEST',
+                       'year_2023_not_assumed_from_readme':True,
+                       'sample_selection':'Availability probes only; not an investment sampling design'}
+              write_json(out/'SUMMARY.json',summary)
+              lines=['# R5B data-source preflight', '',
+                     '**This is not a backtest, not full-A coverage, and not trade permission.**','',
+                     '|Repository|Status|Listed security files (not PIT)|', '|---|---|---|']
+              for x in inventories:
+                  lines.append(f"|{x['repo']}|{x['status']}|{x.get('canonical_security_files','UNKNOWN')}|")
+              lines += ['', '|Probe|Status|Target-year rows|Latest timestamp|', '|---|---|---:|---|']
+              for p in probes:
+                  lines.append(f"|{p['repo']} / {p['file']}|{p['status']}|{p.get('target_year_rows','UNKNOWN')}|{p.get('latest','UNKNOWN')}|")
+              lines += ['', 'Daily reference, adjustment basis, exact limits, minute label semantics,',
+                        'historical universe, and liquidity must pass separately before strategy statistics.',
+                        'A green GitHub job means the acquisition program ended, NOT that data or strategy passed.']
+              (out/'REPORT.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')
+              files={str(p.relative_to(out)):digest(p) for p in sorted(out.rglob('*'))
+                     if p.is_file() and p.name!='MANIFEST_SHA256.json'}
+              write_json(out/'MANIFEST_SHA256.json',files)
+          
+          
+          def main():
+              parser=argparse.ArgumentParser()
+              parser.add_argument('--out',type=Path,default=Path('r5b_source_results'))
+              parser.add_argument('--year',type=int,default=2023,choices=[2023])
+              parser.add_argument('--baostock-child',action='store_true')
+              parser.add_argument('--metadata-only',action='store_true')
+              args=parser.parse_args()
+              if args.baostock_child:
+                  baostock_probe(args.out,args.year);return
+              out=args.out;out.mkdir(parents=True,exist_ok=True)
+              http=PublicHTTP(out);inventories=[];probes=[]
+              for repo in REPOS:
+                  try:
+                      inv=inventory(http,repo,out);inventories.append(inv)
+                      if inv['status']!='INVENTORY_RECEIVED' or args.metadata_only: continue
+                      for p in select_probes(inv):
+                          item={'repo':repo,'file':p,'status':'NOT_IN_LISTED_INVENTORY'}
+                          probes.append(item)
+                          if p not in inv['paths']: continue
+                          stem=clean_name(repo+'__'+p)
+                          dest=out/'native'/stem
+                          downloaded=http.fetch(file_url(repo,inv['sha'],p),dest)
+                          item['native_download']=downloaded
+                          if downloaded['status']!='DOWNLOADED':
+                              item['status']='DOWNLOAD_FAILED';continue
+                          try:
+                              audit=inspect_file(dest,args.year,out/'audits'/stem)
+                              item.update(status='FILE_SCANNED_NOT_CERTIFIED',
+                                          target_year_rows=audit['target_year_rows'],latest=audit['latest'],
+                                          reference_semantics=audit['source_pre_close_semantics_FIRST_2048_ONLY'])
+                          except Exception as e:
+                              item.update(status='PARSE_FAILED',error=type(e).__name__+': '+str(e))
+                          # Retain canonical Parquet bytes. Large CSVs are hashed, scanned, then removed.
+                          if p.endswith('.csv'):
+                              dest.unlink(missing_ok=True)
+                              item['native_csv_retained']=False
+                          write_json(out/'probe_progress.json',probes)
+                  except Exception as e:
+                      inventories.append({'repo':repo,'status':'FAILED','error':type(e).__name__+': '+str(e)})
+              if not args.metadata_only:
+                  try:
+                      result=subprocess.run([sys.executable,str(Path(__file__).resolve()),
+                            '--baostock-child','--out',str(out/'baostock'),'--year',str(args.year)],
+                            capture_output=True,text=True,timeout=180)
+                      (out/'baostock_process.log').write_text(result.stdout+'\n'+result.stderr,encoding='utf-8')
+                      if result.returncode:
+                          write_json(out/'baostock_process_error.json',{'returncode':result.returncode})
+                  except subprocess.TimeoutExpired:
+                      write_json(out/'baostock_process_error.json',{'status':'TIMEOUT_NOT_ZERO_ROWS'})
+                  compare_daily_bridges(out)
+              finish(out,inventories,probes,http)
+              print((out/'REPORT.md').read_text(encoding='utf-8'))
+          
+          if __name__=='__main__':
+              main()
+          R5B_PYTHON_EOF
+          cp r5b_preflight.py r5b_source_results/SOURCE_USED.py
+          sha256sum r5b_preflight.py > r5b_source_results/SOURCE_SHA256.txt
+
+      - name: Fetch bounded public source probes and inspect 2023 coverage
+        timeout-minutes: 23
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$R5B_PY" r5b_preflight.py --year 2023 --out r5b_source_results 2>&1 | tee r5b_preflight_run.log
+
+      - name: Publish evidence summary, including failures
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          if [ -f r5b_preflight_run.log ]; then cp r5b_preflight_run.log r5b_source_results/run.log; fi
+          python3 - <<'R5B_MANIFEST_EOF'
+          import hashlib, json
+          from pathlib import Path
+          root = Path('r5b_source_results')
+          rows = {}
+          for path in sorted(root.rglob('*')):
+              if not path.is_file() or path == root/'MANIFEST_SHA256.json':
+                  continue
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for block in iter(lambda: f.read(1048576), b''):
+                      h.update(block)
+              rows[str(path.relative_to(root))] = h.hexdigest()
+          (root/'MANIFEST_SHA256.json').write_text(json.dumps(rows, indent=2), encoding='utf-8')
+          R5B_MANIFEST_EOF
+          if [ -f r5b_source_results/REPORT.md ]; then
+            cat r5b_source_results/REPORT.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf '%s\n' '## R5B source preflight did not finish' 'Read the dependency and run logs. No backtest result was produced.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload evidence only (retain one day)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: R5B-SOURCE-GATE-${{ github.run_id }}
+          path: r5b_source_results/
+          retention-days: 1
+          compression-level: 6
+          if-no-files-found: error
