@@ -1,0 +1,589 @@
+name: R5B 2023 Phase3 pilot replay and raw data
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: r5b-phase3-pilot
+  cancel-in-progress: false
+
+jobs:
+  replay:
+    if: ${{ github.event.repository.private == false }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        board: [SH_MAIN, SZ_MAIN, CHINEXT, STAR, BSE]
+    env:
+      HF_HUB_DISABLE_IMPLICIT_TOKEN: '1'
+      HF_HUB_ETAG_TIMEOUT: '30'
+      HF_HUB_DOWNLOAD_TIMEOUT: '90'
+      PYTHONUNBUFFERED: '1'
+      R5B_BOARD: ${{ matrix.board }}
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Create evidence folder
+        shell: bash
+        run: mkdir -p "phase3/$R5B_BOARD"
+      - name: Install public-data dependencies (no private tokens)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install numpy==1.26.4 pyarrow==17.0.0 huggingface_hub==0.34.4 'baostock>=0.8.9,<0.9'
+          python -m pip freeze > "phase3/$R5B_BOARD/dependencies.txt"
+      - name: Write fixed pilot engine and execution tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > phase3_replay.py <<'R5B_SOURCE_EOF'
+          """R5B Phase3: fixed pilot, raw-data retention and conditional event replay.
+          Research only. No orders, no portfolio returns, no parameter training.
+          Bar START labels and intrabar OHLC crossing are explicitly UNVERIFIED hypotheses.
+          """
+          from __future__ import annotations
+          import argparse,bisect,csv,gzip,hashlib,io,json,math,os,shutil,statistics,struct,sys,time,traceback
+          from collections import Counter,defaultdict
+          from datetime import date,datetime,timedelta
+          from decimal import Decimal,ROUND_HALF_UP
+          from fractions import Fraction
+          from pathlib import Path
+          from dataclasses import dataclass
+          YEAR=2023
+          REPO='neigezhu/china-a-share-1min-ohlcv'
+          REVISION='ba589a11534825044fe5a6b84838f50ba8d8d188'
+          START=date(2023,1,1);END=date(2023,12,31)
+          WARMUP=date(2022,12,1);BUFFER_END=date(2024,1,31)
+          VARIANTS=['BASE_RAW','D4_ONLY','G9_ONLY','FILTERED','BEST','ABL_TIME','ABL_DIST6','ABL_GAIN35','ABL_TIME_DIST6','ABL_TIME_GAIN35','ABL_DIST6_GAIN35']
+          COSTS=[0,10,20,30,50]
+          COHORT=[{'path': 'data/stock_1m/SH/600824.parquet', 'exchange': 'SH', 'symbol': '600824', 'board': 'SH_MAIN', 'sha256': 'f97d6713134605d013ba719e2d1d68130b9b5f6e572359e61973bae04c50d06d'}, {'path': 'data/stock_1m/SH/603915.parquet', 'exchange': 'SH', 'symbol': '603915', 'board': 'SH_MAIN', 'sha256': '0a7d8e5c0b4f609a40092b20f9af62384ea4bdc3908eeec5cec99cf3d94560a9'}, {'path': 'data/stock_1m/SH/603319.parquet', 'exchange': 'SH', 'symbol': '603319', 'board': 'SH_MAIN', 'sha256': '93840094e094f2a37a79bdeabb4752d3736eda72536767afd6e56cf9f4c6821a'}, {'path': 'data/stock_1m/SH/603416.parquet', 'exchange': 'SH', 'symbol': '603416', 'board': 'SH_MAIN', 'sha256': '58c8d6be36b388f8f60f1c3bab4240dcf9770980db69002772fcaf9152704a07'}, {'path': 'data/stock_1m/SH/603359.parquet', 'exchange': 'SH', 'symbol': '603359', 'board': 'SH_MAIN', 'sha256': 'af2864ae51f8d0468d15ec8a47e3e1eb6d43d1887d951e9dce3e51c0e3cdf18e'}, {'path': 'data/stock_1m/SH/603800.parquet', 'exchange': 'SH', 'symbol': '603800', 'board': 'SH_MAIN', 'sha256': 'c6af0de2a7597f5c585959553ce1b0efb25dcea3645e0cd1f37fab02ffcf1b4b'}, {'path': 'data/stock_1m/SH/601678.parquet', 'exchange': 'SH', 'symbol': '601678', 'board': 'SH_MAIN', 'sha256': '52a03fd2641ade5d31b03d62b851723111fa3439278d53f6c4d6c8b736565d58'}, {'path': 'data/stock_1m/SH/603026.parquet', 'exchange': 'SH', 'symbol': '603026', 'board': 'SH_MAIN', 'sha256': '1a9209e257e939e89587922061ee6813a95d4d3a563151fdbd6e990eb20b87a3'}, {'path': 'data/stock_1m/SZ/000877.parquet', 'exchange': 'SZ', 'symbol': '000877', 'board': 'SZ_MAIN', 'sha256': 'f7a2add6af7d329169bae43ee4004481b5c32acd81de53c508fcdf262d1b9117'}, {'path': 'data/stock_1m/SZ/001332.parquet', 'exchange': 'SZ', 'symbol': '001332', 'board': 'SZ_MAIN', 'sha256': 'f85b50ee497ae838e7bda69ded484759a8db525a3c6eb29ab3bb131f45cc4264'}, {'path': 'data/stock_1m/SZ/002236.parquet', 'exchange': 'SZ', 'symbol': '002236', 'board': 'SZ_MAIN', 'sha256': '52c31b1537a17aef7bed520afdcdbd412837a484efae42cedb42e26c0ffee393'}, {'path': 'data/stock_1m/SZ/002309.parquet', 'exchange': 'SZ', 'symbol': '002309', 'board': 'SZ_MAIN', 'sha256': '8e1c386f0a28c4b4b6b726dd653b16fc462bd0eedf9dc7e308ea30b47847d112'}, {'path': 'data/stock_1m/SZ/002935.parquet', 'exchange': 'SZ', 'symbol': '002935', 'board': 'SZ_MAIN', 'sha256': '4cd95f21fabbda12ed812d27bd0aaf2a48a1d7e66f2573338037c259822b8d78'}, {'path': 'data/stock_1m/SZ/000065.parquet', 'exchange': 'SZ', 'symbol': '000065', 'board': 'SZ_MAIN', 'sha256': 'e7a5474817eefa6fb1e2ec335f3cef8505ca786d303e22ae3d6842a5ca98d603'}, {'path': 'data/stock_1m/SZ/002055.parquet', 'exchange': 'SZ', 'symbol': '002055', 'board': 'SZ_MAIN', 'sha256': '96cc9eb7c03738f692d6511a8f8eddc669565a37081f9869c377bfa34b091004'}, {'path': 'data/stock_1m/SZ/000676.parquet', 'exchange': 'SZ', 'symbol': '000676', 'board': 'SZ_MAIN', 'sha256': '41e6d583a3fd81dc3bb9de35f1ba8ce220b98f7ce55925b67809964285492686'}, {'path': 'data/stock_1m/SZ/300261.parquet', 'exchange': 'SZ', 'symbol': '300261', 'board': 'CHINEXT', 'sha256': '8a668f3b68b63c3536f79cb171e45afec6e72902c57b6383c3ebdf05a495ac84'}, {'path': 'data/stock_1m/SZ/301269.parquet', 'exchange': 'SZ', 'symbol': '301269', 'board': 'CHINEXT', 'sha256': 'a9b08f06ffd268d33b1cea7f36394321541a6b24a26acfb81f0e23fc95358180'}, {'path': 'data/stock_1m/SZ/300324.parquet', 'exchange': 'SZ', 'symbol': '300324', 'board': 'CHINEXT', 'sha256': '4f8a900dfdf2d852b2b013c3a9d37e3663bff72e5758c218e850694f761aa96a'}, {'path': 'data/stock_1m/SZ/300392.parquet', 'exchange': 'SZ', 'symbol': '300392', 'board': 'CHINEXT', 'sha256': 'a085483c430e2d4a1fc828afed80eb3c25669f05533327b608af21d8daabb130'}, {'path': 'data/stock_1m/SZ/301515.parquet', 'exchange': 'SZ', 'symbol': '301515', 'board': 'CHINEXT', 'sha256': '1c69ab24e445ef34fdcbb031142a460bf751898f563c6ff8b90d39368994eeee'}, {'path': 'data/stock_1m/SZ/300755.parquet', 'exchange': 'SZ', 'symbol': '300755', 'board': 'CHINEXT', 'sha256': '46ade440f3cd93c2def50135a730881ed68f08c1ddc42aa5bb47a53d515edefe'}, {'path': 'data/stock_1m/SZ/300730.parquet', 'exchange': 'SZ', 'symbol': '300730', 'board': 'CHINEXT', 'sha256': '66d33b1aad01db6d8e5a91f354dc3d5365829b67b227d2d5e4d51af8677a7ec5'}, {'path': 'data/stock_1m/SZ/301077.parquet', 'exchange': 'SZ', 'symbol': '301077', 'board': 'CHINEXT', 'sha256': '69fad2d3258269f19ece8126786f98f848e46b41744ff9a4199875a11bef0d35'}, {'path': 'data/stock_1m/SH/688788.parquet', 'exchange': 'SH', 'symbol': '688788', 'board': 'STAR', 'sha256': 'a33c22380272cc32f54b70416ebef52394452ffc4d577fecd3db7932a2684f04'}, {'path': 'data/stock_1m/SH/688652.parquet', 'exchange': 'SH', 'symbol': '688652', 'board': 'STAR', 'sha256': 'cb23ede21b49c48a159243fc9332e049ce83912e6bd7d2a03d6fb5e4b5d101be'}, {'path': 'data/stock_1m/SH/688065.parquet', 'exchange': 'SH', 'symbol': '688065', 'board': 'STAR', 'sha256': '40f05de21acf6a6909652bc113ef37c27825db9d28e0b5f307ad26a7763136cd'}, {'path': 'data/stock_1m/SH/688141.parquet', 'exchange': 'SH', 'symbol': '688141', 'board': 'STAR', 'sha256': '8b52381c9d0ed43385da5de6240735a23b2132eee27c4d0478d3c33eeac4d27c'}, {'path': 'data/stock_1m/SH/688313.parquet', 'exchange': 'SH', 'symbol': '688313', 'board': 'STAR', 'sha256': 'cd91c0c2b1d8d0f917aa1abcbed7255543cb7bbf8c9df4bbeabd7219b41640d2'}, {'path': 'data/stock_1m/SH/688568.parquet', 'exchange': 'SH', 'symbol': '688568', 'board': 'STAR', 'sha256': '2e8338c5bdb6d3474f3b5a9997d4743bf8027d0a9217ad1ec3106e894b7f9f36'}, {'path': 'data/stock_1m/SH/688519.parquet', 'exchange': 'SH', 'symbol': '688519', 'board': 'STAR', 'sha256': '18997af5b6d9a1f4708fd891851cb9089f236b58664202a7b925644b56276feb'}, {'path': 'data/stock_1m/SH/688127.parquet', 'exchange': 'SH', 'symbol': '688127', 'board': 'STAR', 'sha256': 'c4d65a2e3de0c21692dc81e4b032640884e04e213c789f2070de116f227b4a13'}, {'path': 'data/stock_1m/BJ/920895.parquet', 'exchange': 'BJ', 'symbol': '920895', 'board': 'BSE', 'sha256': 'fbf2caa9dcd2436142e8b9f271ed734a27a192e2db335925dec54872e36cda12'}, {'path': 'data/stock_1m/BJ/920132.parquet', 'exchange': 'BJ', 'symbol': '920132', 'board': 'BSE', 'sha256': '234e540a40354e4fc849eb3718be048492a1836e981c46c6735ab15ed5ce0dd0'}, {'path': 'data/stock_1m/BJ/920857.parquet', 'exchange': 'BJ', 'symbol': '920857', 'board': 'BSE', 'sha256': '11b9632725f1be0c5c923c17fb49924545332a1d07e6a20e0bd115e4093c82b9'}, {'path': 'data/stock_1m/BJ/920925.parquet', 'exchange': 'BJ', 'symbol': '920925', 'board': 'BSE', 'sha256': '65f13d3825871345f7b47bb53c7870f89fe7a99c08782c1870cf9b7ea2fe7e48'}, {'path': 'data/stock_1m/BJ/920405.parquet', 'exchange': 'BJ', 'symbol': '920405', 'board': 'BSE', 'sha256': 'df7eb4574e565eb4340330335385d6b835afa9a7b703aba8a6b8e084227e7dcf'}, {'path': 'data/stock_1m/BJ/920493.parquet', 'exchange': 'BJ', 'symbol': '920493', 'board': 'BSE', 'sha256': 'fa0bb6523e27a59995ef1ba214e370b560ff05991b60ad60300ce73e9f7d3f48'}, {'path': 'data/stock_1m/BJ/920374.parquet', 'exchange': 'BJ', 'symbol': '920374', 'board': 'BSE', 'sha256': 'e26d010879a145f02de4d8be14c3c2abda04bd13a1eb0afa3481830ed29a7911'}, {'path': 'data/stock_1m/BJ/920058.parquet', 'exchange': 'BJ', 'symbol': '920058', 'board': 'BSE', 'sha256': '283ee9375e180a8a6534050c50496ef5dc12b0307ab20db8001aa9857b7cd8c6'}]
+
+          def jdump(p,x):
+              p=Path(p);p.parent.mkdir(parents=True,exist_ok=True)
+              p.write_text(json.dumps(x,ensure_ascii=False,indent=2,default=str,allow_nan=False),encoding='utf-8')
+          def write_rows(p,rows):
+              p=Path(p);p.parent.mkdir(parents=True,exist_ok=True);rows=list(rows)
+              keys=list(dict.fromkeys(k for r in rows for k in r))
+              with p.open('w',encoding='utf-8-sig',newline='') as f:
+                  w=csv.DictWriter(f,fieldnames=keys);w.writeheader();w.writerows(rows)
+          def read_rows(p):
+              with Path(p).open(encoding='utf-8-sig',newline='') as f:return list(csv.DictReader(f))
+          def digest(p):
+              h=hashlib.sha256()
+              with Path(p).open('rb') as f:
+                  for x in iter(lambda:f.read(1024*1024),b''):h.update(x)
+              return h.hexdigest()
+          def price_cents(value):
+              x=float(value)
+              if not math.isfinite(x) or x<=0:raise ValueError('NONPOSITIVE_OR_NONFINITE_PRICE')
+              c=int((Decimal(str(x))*100).to_integral_value(rounding=ROUND_HALF_UP));q=c/100
+              f32=struct.unpack('<f',struct.pack('<f',q))[0]
+              if min(abs(x-q),abs(x-f32))>max(math.ulp(x)*4,1e-12):
+                  raise ValueError('PRICE_NOT_CENT_OR_FLOAT32_CENT_ENCODING: '+str(value))
+              return c
+
+          def limit_cents(ref:int,pct:int,up:bool=True):
+              return (ref*(100+pct if up else 100-pct)+50)//100
+
+          def phase(t):
+              m=t.hour*60+t.minute
+              return 1 if 570<=m<690 else 2 if 780<=m<897 else 0
+
+          def band(v,r,u,t):
+              timed=v in {'BEST','ABL_TIME','ABL_TIME_DIST6','ABL_TIME_GAIN35'}
+              if timed and t.hour*60+t.minute>=630:return None
+              lo=min((103*r+99)//100,(100*u+104)//105)
+              hi=u-1
+              filtered=v not in {'BASE_RAW','D4_ONLY','G9_ONLY'}
+              if filtered or v=='D4_ONLY':hi=min(hi,(100*u)//104)
+              if filtered or v=='G9_ONLY':hi=min(hi,(109*r+99)//100-1)
+              if v in {'BEST','ABL_DIST6','ABL_TIME_DIST6','ABL_DIST6_GAIN35'}:hi=min(hi,(100*u+105)//106-1)
+              if v in {'BEST','ABL_GAIN35','ABL_TIME_GAIN35','ABL_DIST6_GAIN35'}:
+                  lo=max(lo,(103*r+99)//100);hi=min(hi,105*r//100)
+              return (lo,hi) if lo<=hi else None
+
+          @dataclass(frozen=True)
+          class Bar:
+              t:datetime;o:int;h:int;l:int;c:int;v:int
+
+          def to_bar(x):
+              t=x['timestamp']
+              if not isinstance(t,datetime):t=datetime.fromisoformat(str(t))
+              if t.tzinfo is not None:
+                  from zoneinfo import ZoneInfo
+                  t=t.astimezone(ZoneInfo('Asia/Shanghai')).replace(tzinfo=None)
+              if t.second or t.microsecond:raise ValueError('NON_MINUTE_TIMESTAMP')
+              p=[price_cents(x[k]) for k in ['open','high','low','close']]
+              if p[2]>min(p[0],p[3]) or p[1]<max(p[0],p[3]):raise ValueError('BAD_OHLC')
+              vv=float(x['volume'])
+              if not math.isfinite(vv) or vv<0 or not vv.is_integer():raise ValueError('BAD_VOLUME')
+              return Bar(t,*p,int(vv))
+
+          def ipo_window(ipo,board,d,calendar):
+              if not ipo:return None
+              ipo=date.fromisoformat(ipo)
+              if d<ipo:return True
+              # An IPO before the complete calendar's first date cannot be miscounted
+              # from January 1. Require sufficient known sessions before target day.
+              if ipo<calendar[0]:
+                  return False if bisect.bisect_right(calendar,d)>=5 else None
+              n=bisect.bisect_right(calendar,d)-bisect.bisect_left(calendar,ipo)
+              nfree=5 if board in ('STAR','CHINEXT') or ipo>=date(2023,4,10) else 1
+              return 1<=n<=nfree
+
+          def prepare(symbol,board,raw_rows,daily_rows,basic,calendar):
+              days=defaultdict(list);last=None
+              for x in raw_rows:
+                  b=to_bar(x)
+                  if last is not None and b.t<=last:raise ValueError('DUPLICATE_OR_UNSORTED_RAW_ROWS')
+                  last=b.t;days[b.t.date()].append(b)
+              dm={date.fromisoformat(r['date']):r for r in daily_rows}
+              audits=[];infos={};pct=10 if board in ('SH_MAIN','SZ_MAIN') else 20
+              prev_close=None
+              for d in calendar:
+                  rows=days.get(d,[]);r=dm.get(d)
+                  z={'symbol':symbol,'date':str(d),'board':board,'rows':len(rows),'positive_volume_rows':sum(b.v>0 for b in rows),'status':'READY_PROXY','issues':'','entry_eligible':False,'source_label_contract':'START_LABEL_ASSUMED_NOT_CERTIFIED'}
+                  reasons=[];info={'rows':rows,'ref':None,'up':None,'dn':None,'entry_eligible':False,'paused':False,'failure':None,'corporate_action_gap':False,'daily':r}
+                  if r is None:
+                      ipo_text=basic.get('ipoDate','')
+                      if ipo_text and d<date.fromisoformat(ipo_text):
+                          z['status']='PRE_IPO_NOT_EXPECTED'
+                      else:
+                          reasons.append('NO_DAILY_REFERENCE')
+                  else:
+                      try:
+                          ref=price_cents(r['preclose']);status=str(r['tradestatus']);st=str(r['isST'])
+                          day_pct=5 if st=='1' and board in ('SH_MAIN','SZ_MAIN') else pct
+                          info.update(ref=ref,up=limit_cents(ref,day_pct),dn=limit_cents(ref,day_pct,False),paused=status!='1')
+                          if prev_close is not None and ref!=prev_close:info['corporate_action_gap']=True
+                          # This research adapter does not invent dividend cash, split
+                          # shares or tax payments when an open position crosses a gap.
+                          p=[b for b in rows if b.v>0]
+                          z.update(reference_cents=ref,st_flag=st,paused=info['paused'],corporate_action_gap=info['corporate_action_gap'])
+                          if not info['paused']:
+                              if not rows or not p:reasons.append('NO_TRADING_MINUTES')
+                              if rows:
+                                  clock=[b.t.strftime('%H:%M') for b in rows]
+                                  expected=[(datetime.combine(d,datetime.min.time())+timedelta(minutes=m)).strftime('%H:%M') for m in list(range(570,691))+list(range(781,901))]
+                                  z['observed_source_grid']='09:30_POINT_PLUS_09:31_TO_11:30_AND_13:01_TO_15:00'
+                                  if clock!=expected:reasons.append('MINUTE_GRID_INCOMPLETE')
+                              if p:
+                                  agg=[p[0].o,max(b.h for b in p),min(b.l for b in p),p[-1].c]
+                                  dailyprice=[price_cents(r[k]) for k in ['open','high','low','close']]
+                                  for k,a,e in zip(['open','high','low','close'],agg,dailyprice):z[k+'_delta_cents']=a-e
+                                  if agg!=dailyprice:reasons.append('POSITIVE_VOLUME_OHLC_MISMATCH')
+                                  if r.get('volume'):
+                                      vd=sum(b.v for b in rows)-int(Decimal(r['volume']));z['volume_delta_raw_units']=vd
+                                      # Retain, report, do NOT scale to fabricate matching totals.
+                                      if vd:z['volume_warning']='VENDOR_VOLUME_DIFFERENCE_NO_CAPACITY_CERTIFICATION'
+                              ipoflag=ipo_window(basic.get('ipoDate',''),board,d,calendar)
+                              z['ipo_no_limit_window']=ipoflag
+                              if ipoflag is None:reasons.append('IPO_CALENDAR_UNRESOLVED')
+                              name_unknown=bool(basic.get('outDate'))
+                              # Whole-symbol data quarantine only, NOT a live/PIT signal
+                              # exclusion based on future delisting. Universe is not certified.
+                              if name_unknown:reasons.append('HISTORICAL_DELIST_NAME_TIMELINE_MISSING')
+                              if st=='0' and ipoflag is False and p:
+                                  breach=any(b.h>info['up'] or b.l<info['dn'] for b in p)
+                                  z['cent_limit_breach']=breach
+                                  if breach:reasons.append('CANDIDATE_LIMIT_BREACH')
+                              info['entry_eligible']=st=='0' and ipoflag is False and not reasons
+                          prev_close=price_cents(r['close'])
+                      except Exception as e:reasons.append('DAILY_PARSE_ERROR:'+str(e));prev_close=None
+                  if reasons:
+                      info['failure']='|'.join(reasons);z['status']='DATA_QUARANTINE_NOT_NO_SIGNAL'
+                  elif info['paused']:z['status']='SUSPENDED'
+                  elif not info['entry_eligible'] and z['status']!='PRE_IPO_NOT_EXPECTED':z['status']='STRATEGY_OR_IPO_EXCLUDED'
+                  z['entry_eligible']=info['entry_eligible'];z['issues']='|'.join(reasons)
+                  infos[d]=info;audits.append(z)
+              return infos,audits
+
+          def signal(rows,v,r,u):
+              for i,b in enumerate(rows):
+                  if b.v<=0 or not phase(b.t):continue
+                  bands=band(v,r,u,b.t)
+                  if bands is None:continue
+                  lo=max(bands[0],b.l);hi=min(bands[1],b.h)
+                  if lo<=hi:
+                      p=max(lo,min(b.o,hi))
+                      return i,p
+              return None
+
+          def fill(rows,i,v,r,u,mode):
+              if i+1>=len(rows):return None,'NO_NEXT_BAR'
+              a,b=rows[i],rows[i+1]
+              if b.t-a.t!=timedelta(minutes=1) or phase(a.t)!=phase(b.t) or not phase(b.t):return None,'NO_CONTIGUOUS_NEXT_MINUTE'
+              if b.v<=0:return None,'ZERO_VOLUME_NEXT_MINUTE'
+              if b.o>=u:return None,'NEXT_OPEN_AT_LIMIT'
+              limits=band(v,r,u,b.t)
+              if mode=='NEXT_OPEN_RECHECK' and (limits is None or not limits[0]<=b.o<=limits[1]):return None,'NEXT_OPEN_FILTER_FAIL'
+              return b,None
+
+          def exit_bar(b,entry,up,dn,path,eod_mode):
+              if b.v<=0 or not phase(b.t):return None,None
+              tp=(entry*105+99)//100;sl=entry*95//100
+              if b.o<=sl:
+                  return (None,'STOP_OPEN_LIMIT_UNRESOLVED') if b.o<=dn else ((b.o,'STOP_GAP_OPEN','BAR_OPEN'),None)
+              if b.o>=tp:
+                  if b.o>=up:return None,'TP_OPEN_LIMIT_WAIT_NEXT_BAR'
+                  return (b.o,'TAKE_PROFIT_GAP_OPEN','BAR_OPEN'),None
+              # Fixed-time orders must not use the future H/L of the 14:55 bar first.
+              if b.t.hour*60+b.t.minute>=895 and eod_mode=='EOD_OPEN':
+                  if dn<b.o<up:return (b.o,'EOD_OPEN_PROXY','BAR_OPEN'),None
+                  return None,'EOD_OPEN_AT_LIMIT_WAIT_NEXT_BAR'
+              hs=b.l<=sl;ht=b.h>=tp
+              if hs and sl<=dn:return None,'STOP_TOUCH_LIMIT_UNRESOLVED'
+              if ht and tp>=up:ht=False
+              if hs and ht:return ((sl,'BOTH_HIT_STOP_FIRST','WITHIN_BAR') if path=='STOP_FIRST' else (tp,'BOTH_HIT_TP_FIRST','WITHIN_BAR')),None
+              if hs:return (sl,'STOP_TOUCH_PROXY','WITHIN_BAR'),None
+              if ht:return (tp,'TP_TOUCH_PROXY','WITHIN_BAR'),None
+              if b.t.hour*60+b.t.minute>=895 and eod_mode=='EOD_CLOSE_LEGACY' and dn<b.c<up:
+                  return (b.c,'EOD_CLOSE_LEGACY_PROXY','BAR_END'),None
+              return None,None
+
+          def scan(symbol,infos,calendar,variants=None,modes=None,paths=None,eod_mode='EOD_OPEN'):
+              sigs=[];trades=[];date_index={d:i for i,d in enumerate(calendar)}
+              for v in (variants or VARIANTS):
+                for mode in (modes or ['NEXT_OPEN_RECHECK','NEXT_OPEN_MARKET']):
+                 for path in (paths or ['STOP_FIRST','TP_FIRST']):
+                  blocked_until=None
+                  for d in calendar:
+                      if not START<=d<=END:continue
+                      a=infos[d]
+                      if not a['entry_eligible']:continue
+                      first=signal(a['rows'],v,a['ref'],a['up'])
+                      if first is None:continue
+                      i,sp=first;sr={'symbol':symbol,'variant':v,'fill_mode':mode,'path':path,'eod_mode':eod_mode,'signal_date':str(d),'signal_time':a['rows'][i].t.isoformat(' '),'signal_price':sp/100,'signal_gain':sp/a['ref']-1,'signal_distance':a['up']/sp-1,'status':'CANDIDATE','official_pit_certified':False}
+                      if blocked_until is not None and d<=blocked_until:
+                          sr['status']='EXISTING_OR_UNRESOLVED_POSITION';sigs.append(sr);continue
+                      fb,reason=fill(a['rows'],i,v,a['ref'],a['up'],mode)
+                      if fb is None:sr['status']=reason;sigs.append(sr);continue
+                      sr.update(status='FILLED_PROXY',entry_time=fb.t.isoformat(' '),entry_price=fb.o/100,entry_gain=fb.o/a['ref']-1,entry_distance=a['up']/fb.o-1)
+                      sigs.append(dict(sr));tr=dict(sr);entry=fb.o;found=None;unresolved=None;bc=sc=0
+                      tr['t_day_touched_up']=any(b.h>=a['up'] and b.v>0 for b in a['rows'][i+1:]);tr['t_day_close_at_up']=a['rows'][-1].c==a['up']
+                      tr['exit_time']=None;tr['exit_price']=None;tr['gross_return']=None;tr['net_return_20bp']=None
+                      t1=None
+                      for xd in calendar[date_index[d]+1:]:
+                          a2=infos[xd]
+                          if t1 is None:t1=xd
+                          if a2['corporate_action_gap']:
+                              unresolved='CORPORATE_ACTION_CASH_SHARE_BRIDGE_MISSING';break
+                          if a2['failure']:
+                              unresolved='HELD_PATH_DATA_GAP:'+a2['failure'];break
+                          if a2['paused']:continue
+                          for b in a2['rows']:
+                              dec,state=exit_bar(b,entry,a2['up'],a2['dn'],path,eod_mode)
+                              if state and 'STOP' in state:bc+=1
+                              if state and 'TP' in state:sc+=1
+                              if dec is not None:
+                                  xp,why,when=dec
+                                  found=(b,xp,why,when);break
+                          if found:break
+                      if found:
+                          b,xp,why,when=found
+                          tr.update(exit_time=b.t.isoformat(' '),exit_price=xp/100,exit_reason=why,exit_timing=when,gross_return=xp/entry-1,net_return_20bp=xp/entry-1-.002,status='RESOLVED_RESEARCH_PROXY')
+                          blocked_until=b.t.date()
+                      else:
+                          tr.update(exit_reason=unresolved or 'RIGHT_CENSORED_AT_BUFFER_END',status='UNRESOLVED_KEEP_POSITION')
+                          blocked_until=calendar[-1]
+                      tr.update(blocked_stop_bars=bc,suppressed_takeprofit_bars=sc)
+                      if t1 is not None:
+                          d1=infos[t1]
+                          if not d1['failure'] and not d1['corporate_action_gap'] and d1['daily']:
+                              tr['t1_close_return_proxy']=price_cents(d1['daily']['close'])/entry-1
+                      trades.append(tr)
+              return sigs,trades
+
+          def summarize(trades):
+              groups=defaultdict(list)
+              for r in trades:groups[(r['variant'],r['fill_mode'],r['path'],r['eod_mode'])].append(r)
+              out=[]
+              for key,items in sorted(groups.items()):
+                resolved=[r for r in items if r.get('gross_return') is not None]
+                for cost in COSTS:
+                  vals=[r['gross_return']-cost/10000 for r in resolved]
+                  row=dict(zip(['variant','fill_mode','path','eod_mode'],key));row.update(cost_bp=cost,total_positions=len(items),resolved=len(vals),unresolved=len(items)-len(vals),interpretation='CONDITIONAL_PILOT_NOT_FULL_A_OR_ALPHA')
+                  if vals:
+                      pos=sum(x for x in vals if x>0);neg=-sum(x for x in vals if x<0)
+                      row.update(win_rate=sum(x>0 for x in vals)/len(vals),mean_net=statistics.mean(vals),median_net=statistics.median(vals),profit_factor=pos/neg if neg else None,worst=min(vals),best=max(vals))
+                  out.append(row)
+              return out
+
+          def rs_rows(rs):
+              if rs.error_code!='0':raise RuntimeError(str(rs.error_code)+':'+str(rs.error_msg))
+              rows=[]
+              while rs.next():rows.append(dict(zip(rs.fields,rs.get_row_data())))
+              if rs.error_code!='0':raise RuntimeError(str(rs.error_code)+':'+str(rs.error_msg))
+              return rows
+
+          def download_and_export(rec,out):
+              from huggingface_hub import hf_hub_download
+              import pyarrow.parquet as pq
+              cache=out/'cache';schema=None
+              local=Path(hf_hub_download(REPO,rec['path'],repo_type='dataset',revision=REVISION,cache_dir=str(cache),token=False))
+              actual=digest(local)
+              if actual!=rec['sha256']:raise RuntimeError('NATIVE_PARQUET_HASH_CHANGED_VS_PHASE2')
+              pf=pq.ParquetFile(local);schema=str(pf.schema_arrow)
+              names=pf.schema_arrow.names
+              required=['timestamp','open','high','low','close','volume']
+              if not set(required)<=set(names):raise RuntimeError('SCHEMA_MISSING_FIELDS')
+              cols=[c for c in ['symbol','exchange',*required,'turnover'] if c in names]
+              target=out/'raw_minutes'/(rec['exchange']+'_'+rec['symbol']+'.csv.gz');target.parent.mkdir(parents=True,exist_ok=True)
+              rows=[];file_index=0
+              with gzip.open(target,'wt',encoding='utf-8',newline='') as f:
+                  writer=csv.DictWriter(f,fieldnames=['source_row_index',*cols]);writer.writeheader()
+                  for batch in pf.iter_batches(batch_size=65536,columns=cols):
+                      for raw in batch.to_pylist():
+                          i=file_index;file_index+=1
+                          t=raw['timestamp']
+                          if not isinstance(t,datetime):t=datetime.fromisoformat(str(t))
+                          if t.tzinfo is not None:
+                              from zoneinfo import ZoneInfo
+                              t=t.astimezone(ZoneInfo('Asia/Shanghai')).replace(tzinfo=None)
+                          if not WARMUP<=t.date()<=BUFFER_END:continue
+                          # Preserve native float values in the exported CSV. Integer
+                          # canonicalization is separately checked, not overwritten here.
+                          z={'source_row_index':i,**raw,'timestamp':t.isoformat(' ')};writer.writerow(z);rows.append(z)
+              meta={'symbol':rec['symbol'],'exchange':rec['exchange'],'revision':REVISION,'native_parquet_sha256':actual,'native_parquet_bytes':local.stat().st_size,'schema':schema,'exported_rows':len(rows),'exported_csv_sha256':digest(target),'export_start':str(WARMUP),'export_end':str(BUFFER_END),'bar_label_semantics':'UNVERIFIED_START_ASSUMPTION','native_fullspan_not_in_artifact':True}
+              jdump(out/'metadata'/(rec['symbol']+'.json'),meta)
+              del pf
+              shutil.rmtree(cache,ignore_errors=True)
+              return rows
+
+          def main():
+              ap=argparse.ArgumentParser();ap.add_argument('--board',required=True);ap.add_argument('--out',default='phase3');args=ap.parse_args()
+              out=Path(args.out)/args.board;out.mkdir(parents=True,exist_ok=True)
+              cohort=[r for r in COHORT if r['board']==args.board]
+              if not cohort:raise RuntimeError('EMPTY_COHORT')
+              jdump(out/'contract.json',{'version':'R5B-PHASE3-PILOT-20260918','dataset_revision':REVISION,'board':args.board,'cohort':cohort,'strategy_window':[str(START),str(END)],'export_window':[str(WARMUP),str(BUFFER_END)],'primary':['NEXT_OPEN_RECHECK','STOP_FIRST','EOD_OPEN','20bp'],'legacy_eod_is_secondary_only':True,'heat_factor':False,'portfolio':False,'full_a_certified':False,'timestamp_start_labels_assumed':True,'no_parameter_training':True,'data_quarantine_is_not_live_strategy_filter':True})
+              raw_errors=[];daily_all=[];audit_all=[];signals=[];trades=[];status=[]
+              bs=None;calendar=[]
+              if args.board!='BSE':
+                  try:
+                      import baostock as bs
+                      lg=bs.login()
+                      if lg.error_code!='0':raise RuntimeError(lg.error_msg)
+                      # Covers the 2022 year-end IPO boundary and a 2024 exit buffer.
+                      calrows=rs_rows(bs.query_trade_dates(start_date=str(WARMUP),end_date=str(BUFFER_END)))
+                      calendar=[date.fromisoformat(r['calendar_date']) for r in calrows if r['is_trading_day']=='1']
+                      write_rows(out/'trade_calendar.csv',calrows)
+                  except Exception as e:
+                      raw_errors.append({'stage':'baostock_login_calendar','error':repr(e)});bs=None
+              try:
+                for rec in cohort:
+                  key=rec['exchange']+'_'+rec['symbol'];s={'symbol':key,'board':args.board,'status':'STARTED'}
+                  try:
+                      raw=download_and_export(rec,out);s['raw_export_rows']=len(raw)
+                      if args.board=='BSE':
+                          s['status']='RAW_EXPORTED_BSE_REFERENCE_AND_ID_MAP_MISSING';status.append(s);continue
+                      if bs is None:raise RuntimeError('NO_DAILY_ADAPTER')
+                      code=rec['exchange'].lower()+'.'+rec['symbol']
+                      basicrows=rs_rows(bs.query_stock_basic(code=code))
+                      if not basicrows:raise RuntimeError('NO_BASIC_ID_RECORD')
+                      basic=basicrows[0];write_rows(out/'basic_CURRENT_VENDOR_SNAPSHOT'/f'{key}.csv',basicrows)
+                      fields='date,code,open,high,low,close,preclose,volume,amount,adjustflag,tradestatus,isST'
+                      daily=rs_rows(bs.query_history_k_data_plus(code,fields,start_date=str(WARMUP),end_date=str(BUFFER_END),frequency='d',adjustflag='3'))
+                      if not daily:raise RuntimeError('NO_DAILY_ROWS')
+                      write_rows(out/'daily'/f'{key}.csv',daily)
+                      infos,au=prepare(key,args.board,raw,daily,basic,calendar)
+                      audit_all.extend(au)
+                      si,tr=scan(key,infos,calendar);signals.extend(si);trades.extend(tr)
+                      # Retain old close-price proxy as a separately-labelled comparison,
+                      # never call that the 14:55:00 executed price.
+                      si2,tr2=scan(key,infos,calendar,variants=['FILTERED','BEST'],modes=['NEXT_OPEN_RECHECK'],paths=['STOP_FIRST'],eod_mode='EOD_CLOSE_LEGACY')
+                      signals.extend(si2);trades.extend(tr2)
+                      s.update(status='RESEARCH_REPLAY_COMPLETED',positions=len(tr)+len(tr2),target_data_quarantine_days=sum(a['status']=='DATA_QUARANTINE_NOT_NO_SIGNAL' and str(START)<=a['date']<=str(END) for a in au))
+                  except Exception as e:
+                      s.update(status='ERROR_NOT_NO_SIGNAL',error=repr(e));raw_errors.append({'symbol':key,'error':repr(e),'traceback':traceback.format_exc()})
+                  status.append(s)
+                  # Write after EVERY symbol: a late failure cannot erase successful data.
+                  write_rows(out/'symbol_status.csv',status);write_rows(out/'day_audit.csv',audit_all);write_rows(out/'signals.csv',signals);write_rows(out/'trades.csv',trades);jdump(out/'errors.json',raw_errors)
+                  print(key,s['status'],flush=True)
+              finally:
+                  if bs is not None:
+                      try:bs.logout()
+                      except Exception:pass
+                  write_rows(out/'symbol_status.csv',status);write_rows(out/'event_summary.csv',summarize(trades));jdump(out/'errors.json',raw_errors)
+                  resolved=sum(r.get('gross_return') is not None for r in trades)
+                  meta={'status':'PILOT_RESEARCH_NOT_FULL_A','symbols_attempted':len(status),'target_symbols':len(cohort),'symbols_replayed':sum(s['status']=='RESEARCH_REPLAY_COMPLETED' for s in status),'scenario_positions':len(trades),'scenario_resolved':resolved,'independent_positions_not_equal_to_scenario_rows':True,'bar_label_and_fill_model_certified':False,'raw_data_retained':True,'full_a_certified':False}
+                  jdump(out/'SUMMARY.json',meta)
+                  (out/'REPORT.md').write_text('# R5B Phase3 pilot research\n\nRaw minute exports, daily inputs and conditional event ledgers are retained.\nNot a full-A backtest, not trade permission.\n\n'+json.dumps(meta,ensure_ascii=False,indent=2),encoding='utf-8')
+                  shutil.rmtree(out/'cache',ignore_errors=True)
+                  # The workflow adds SOURCE_USED.py and a final manifest after completion.
+          if __name__=='__main__':main()
+          R5B_SOURCE_EOF
+          cat > test_phase3.py <<'R5B_TEST_EOF'
+          import unittest,struct,random,sys
+          from datetime import datetime,date,timedelta
+          from fractions import Fraction
+          from pathlib import Path
+          sys.path.insert(0,str(Path(__file__).resolve().parent))
+          import phase3_replay as p
+          D=date(2023,1,3)
+          def b(tm='09:40',o=1030,h=None,l=None,c=None,v=100,day=D):
+           return p.Bar(datetime.fromisoformat(str(day)+' '+tm),o,h or o,l or o,c or o,v)
+          def info(rows,entry=True,ref=1000,up=1100,dn=900,failure=None,corp=False):
+           return dict(rows=rows,ref=ref,up=up,dn=dn,entry_eligible=entry,paused=False,failure=failure,corporate_action_gap=corp,daily={'close':str(rows[-1].c/100)} if rows else None)
+          class Tests(unittest.TestCase):
+           def test_cent_roundtrip(self):
+            for x in [19.35,38.4,65.4,0.69,125.32]:self.assertEqual(p.price_cents(struct.unpack('<f',struct.pack('<f',x))[0]),round(x*100))
+           def test_genuine_off_grid_rejected(self):
+            for x in [19.351,0.6901,65.4001]:
+             with self.assertRaises(ValueError):p.price_cents(x)
+           def test_nan_zero_rejected(self):
+            for x in [0,-1,float('nan'),float('inf')]:
+             with self.assertRaises(ValueError):p.price_cents(x)
+           def test_one_cent_break_still_detectable(self):self.assertGreater(p.price_cents(19.36),p.price_cents(19.35))
+           def test_best_equal5_allowed(self):self.assertEqual(p.band('BEST',1000,1200,b().t),(1030,1050))
+           def test_best_equal6_excluded(self):self.assertEqual(p.band('BEST',964,1060,b().t)[1],999)
+           def test_no_legal_price(self):self.assertIsNone(p.band('BEST',67,74,b().t))
+           def test_time_strict(self):self.assertIsNone(p.band('BEST',1000,1100,b('10:30').t))
+           def test_old_ipo_not_jan_ipo(self):
+            cal=[date(2022,12,1)+timedelta(days=k) for k in range(50) if (date(2022,12,1)+timedelta(days=k)).weekday()<5]
+            self.assertFalse(p.ipo_window('2019-06-14','SH_MAIN',date(2023,1,3),cal))
+            self.assertFalse(p.ipo_window('2022-12-23','STAR',date(2023,1,3),cal))
+           def test_new_ipo_first5(self):
+            cal=[date(2023,7,25)+timedelta(days=k) for k in range(10) if (date(2023,7,25)+timedelta(days=k)).weekday()<5]
+            self.assertTrue(p.ipo_window('2023-07-25','CHINEXT',cal[4],cal));self.assertFalse(p.ipo_window('2023-07-25','CHINEXT',cal[5],cal))
+           def test_missing_next_minute(self):
+            self.assertIsNone(p.fill([b('09:40'),b('10:30')],0,'FILTERED',1000,1100,'NEXT_OPEN_RECHECK')[0])
+           def test_zero_volume_fill(self):
+            self.assertIsNone(p.fill([b('09:40'),b('09:41',v=0)],0,'FILTERED',1000,1100,'NEXT_OPEN_RECHECK')[0])
+           def test_lunch_not_nextminute(self):
+            self.assertIsNone(p.fill([b('11:29'),b('13:00')],0,'FILTERED',1000,1100,'NEXT_OPEN_RECHECK')[0])
+           def test_gap_stop_not_capped5(self):
+            r,_=p.exit_bar(b(o=920),1000,1100,900,'STOP_FIRST','EOD_OPEN');self.assertEqual(r[0],920)
+           def test_limit_down_no_fake_fill(self):self.assertIsNone(p.exit_bar(b(o=900),1000,1100,900,'STOP_FIRST','EOD_OPEN')[0])
+           def test_limit_up_suppresses_tp(self):self.assertIsNone(p.exit_bar(b(o=1100),1000,1100,900,'STOP_FIRST','EOD_OPEN')[0])
+           def test_fixedtime_no_future_ohlc(self):
+            r,_=p.exit_bar(b('14:55',o=1000,h=1060,l=940,c=1020),1000,1100,900,'STOP_FIRST','EOD_OPEN');self.assertEqual(r[:2],(1000,'EOD_OPEN_PROXY'))
+           def test_both_paths(self):
+            z=b(o=1000,h=1060,l=940)
+            self.assertEqual(p.exit_bar(z,1000,1100,900,'STOP_FIRST','EOD_OPEN')[0][0],950)
+            self.assertEqual(p.exit_bar(z,1000,1100,900,'TP_FIRST','EOD_OPEN')[0][0],1050)
+           def test_t_day_no_exit(self):
+            d2=D+timedelta(days=1);a=info([b('09:40'),b('09:41'),b('10:00',o=1150)])
+            z=info([b('14:55',o=1030,day=d2)],False)
+            _,ts=p.scan('x',{D:a,d2:z},[D,d2],['FILTERED'],['NEXT_OPEN_RECHECK'],['STOP_FIRST']);self.assertEqual(ts[0]['exit_time'],str(d2)+' 14:55:00')
+           def test_missing_held_path_keeps_position(self):
+            d2=D+timedelta(days=1);d3=D+timedelta(days=2)
+            a=info([b('09:40'),b('09:41')]);bad=info([],False,failure='MISSING');a3=info([b('09:40',day=d3),b('09:41',day=d3)])
+            ss,ts=p.scan('x',{D:a,d2:bad,d3:a3},[D,d2,d3],['FILTERED'],['NEXT_OPEN_RECHECK'],['STOP_FIRST']);self.assertEqual(len(ts),1);self.assertEqual(ts[0]['status'],'UNRESOLVED_KEEP_POSITION');self.assertEqual(ss[-1]['status'],'EXISTING_OR_UNRESOLVED_POSITION')
+           def test_corporate_action_not_fake_profit(self):
+            d2=D+timedelta(days=1);a=info([b(),b('09:41')]);a2=info([b('09:30',day=d2)],False,corp=True)
+            _,ts=p.scan('x',{D:a,d2:a2},[D,d2],['FILTERED'],['NEXT_OPEN_RECHECK'],['STOP_FIRST']);self.assertIn('CORPORATE_ACTION',ts[0]['exit_reason']);self.assertIsNone(ts[0]['gross_return'])
+           def test_random_band_math(self):
+            rng=random.Random(20260918)
+            for _ in range(5000):
+             r=rng.randint(50,100000);u=p.limit_cents(r,rng.choice([10,20,30]));px=rng.randint(max(1,r*8//10),u);tm=rng.choice(['09:40','10:29','10:30','14:30']);v=rng.choice(p.VARIANTS);bb=p.band(v,r,u,b(tm).t)
+             gain=Fraction(px,r)-1;dist=Fraction(u,px)-1
+             x=(gain>=Fraction(3,100) or dist<=Fraction(5,100)) and px<u
+             f=v not in {'BASE_RAW','D4_ONLY','G9_ONLY'}
+             if f or v=='D4_ONLY':x=x and dist>=Fraction(4,100)
+             if f or v=='G9_ONLY':x=x and gain<Fraction(9,100)
+             if v in {'BEST','ABL_DIST6','ABL_TIME_DIST6','ABL_DIST6_GAIN35'}:x=x and dist>Fraction(6,100)
+             if v in {'BEST','ABL_GAIN35','ABL_TIME_GAIN35','ABL_DIST6_GAIN35'}:x=x and Fraction(3,100)<=gain<=Fraction(5,100)
+             if v in {'BEST','ABL_TIME','ABL_TIME_DIST6','ABL_TIME_GAIN35'}:x=x and tm<'10:30'
+             self.assertEqual(bool(bb and bb[0]<=px<=bb[1]),bool(x))
+           def test_fixed_source_inventory(self):
+            self.assertEqual(len(p.COHORT),40);self.assertEqual(len({r['path'] for r in p.COHORT}),40)
+            self.assertTrue(all(len(r['sha256'])==64 for r in p.COHORT))
+          if __name__=='__main__':unittest.main(verbosity=2)
+          R5B_TEST_EOF
+          cp phase3_replay.py "phase3/$R5B_BOARD/SOURCE_USED.py"
+          cp test_phase3.py "phase3/$R5B_BOARD/TESTS_USED.py"
+          python test_phase3.py 2>&1 | tee "phase3/$R5B_BOARD/tests.log"
+      - name: Export raw minutes and replay eligible research paths
+        timeout-minutes: 40
+        shell: bash
+        run: |
+          set -euo pipefail
+          python phase3_replay.py --board "$R5B_BOARD" --out phase3 2>&1 | tee "phase3/$R5B_BOARD/run.log"
+      - name: Finalize evidence even on failure
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          python - <<'R5B_FINAL_EOF'
+          from pathlib import Path
+          import os,json,hashlib,shutil
+          p=Path('phase3')/os.environ['R5B_BOARD'];p.mkdir(parents=True,exist_ok=True)
+          shutil.rmtree(p/'cache',ignore_errors=True)
+          if not (p/'SUMMARY.json').exists():
+              (p/'SUMMARY.json').write_text(json.dumps({'status':'WORKFLOW_INCOMPLETE_NOT_ZERO_TRADES','full_a_certified':False}),encoding='utf-8')
+          hashes={}
+          for f in sorted(p.rglob('*')):
+              if f.is_file() and f.name!='MANIFEST_SHA256.json':
+                  h=hashlib.sha256()
+                  with f.open('rb') as x:
+                      for b in iter(lambda:x.read(1048576),b''):h.update(b)
+                  hashes[str(f.relative_to(p))]=h.hexdigest()
+          (p/'MANIFEST_SHA256.json').write_text(json.dumps(hashes,indent=2),encoding='utf-8')
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a',encoding='utf-8') as f:
+              f.write('## '+os.environ['R5B_BOARD']+'\n\n')
+              f.write((p/'REPORT.md').read_text(encoding='utf-8') if (p/'REPORT.md').exists() else 'Incomplete. Download logs. No full-A result.\n')
+          R5B_FINAL_EOF
+      - name: Save board evidence (temporary one day)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: R5B-P3-part-${{ matrix.board }}-${{ github.run_id }}
+          path: phase3/
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
+  collect:
+    if: ${{ always() && github.event.repository.private == false }}
+    needs: replay
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Collect each board (raw minutes included)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: R5B-P3-part-*-${{ github.run_id }}
+          path: combined
+          merge-multiple: true
+      - name: Generate honest completion summary
+        shell: bash
+        run: |
+          python - <<'R5B_COLLECT_EOF'
+          from pathlib import Path
+          import csv,json,os,hashlib
+          p=Path('combined');p.mkdir(exist_ok=True)
+          boards=['SH_MAIN','SZ_MAIN','CHINEXT','STAR','BSE']
+          manifest={};summary=[]
+          for board in boards:
+              f=p/board/'SUMMARY.json'
+              item=json.loads(f.read_text()) if f.exists() else {'status':'MISSING_SHARD'}
+              item['board']=board;summary.append(item)
+          (p/'RUN_SUMMARY.json').write_text(json.dumps({'run_id':os.environ['GITHUB_RUN_ID'],'status':'PILOT_RESEARCH_NOT_FULL_A','board_results':summary,'full_a_certified':False,'new_raw_minutes_in_board_folders':True,'source_minute_label_semantics_not_certified':True},indent=2),encoding='utf-8')
+          lines=['# R5B Phase3 2023 pilot replay','', '**This is NOT a full-A/three-year backtest or trade permission.**', '', 'Download the FINAL ZIP and upload it to ChatGPT. Raw minute CSV.GZ files are included.', '', '|Board|Status|Attempted|Replayed|Scenario positions|','|---|---|---:|---:|---:|']
+          for r in summary:lines.append('|'+str(r['board'])+'|'+str(r['status'])+'|'+str(r.get('symbols_attempted','UNKNOWN'))+'|'+str(r.get('symbols_replayed','UNKNOWN'))+'|'+str(r.get('scenario_positions','UNKNOWN'))+'|')
+          (p/'REPORT.md').write_text('\n'.join(lines),encoding='utf-8')
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:f.write('\n'.join(lines))
+          for f in sorted(p.rglob('*')):
+              if f.is_file() and f!=p/'MANIFEST_SHA256.json':
+                  h=hashlib.sha256()
+                  with f.open('rb') as x:
+                      for b in iter(lambda:x.read(1048576),b''):h.update(b)
+                  manifest[str(f.relative_to(p))]=h.hexdigest()
+          (p/'MANIFEST_SHA256.json').write_text(json.dumps(manifest,indent=2),encoding='utf-8')
+          R5B_COLLECT_EOF
+      - name: Upload FINAL result ZIP (choose this artifact)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: R5B-PHASE3-2023-REPLAY-FINAL-${{ github.run_id }}
+          path: combined/
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: error
