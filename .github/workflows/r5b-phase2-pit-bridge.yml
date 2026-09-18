@@ -1,0 +1,391 @@
+name: R5B 2023 Phase2 PIT and price-basis bridge
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  phase2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install bounded public-data dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install pandas numpy pyarrow 'huggingface_hub>=0.25' hf_xet baostock
+
+      - name: Write Phase2 audit program
+        shell: bash
+        run: |
+          cat > r5b_phase2.py <<'PY'
+          from __future__ import annotations
+          import csv, hashlib, json, math, os, re, sys, traceback
+          from collections import Counter, defaultdict
+          from dataclasses import asdict, dataclass
+          from datetime import datetime
+          from decimal import Decimal, ROUND_HALF_UP
+          from pathlib import Path
+
+          import numpy as np
+          import pandas as pd
+          import pyarrow.parquet as pq
+          from huggingface_hub import HfApi, hf_hub_download
+
+          YEAR = 2023
+          REPO = 'neigezhu/china-a-share-1min-ohlcv'
+          OUT = Path('r5b_phase2_results')
+          CACHE = Path('hf_cache')
+          N_PER_BOARD = 8
+          MAX_SCAN_PER_BOARD = 36
+          BOARDS = ['SH_MAIN','SZ_MAIN','CHINEXT','STAR','BSE']
+          PRICE_COLS = ['timestamp','open','high','low','close','volume']
+
+          def jdump(path: Path, obj):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(json.dumps(obj, ensure_ascii=False, indent=2, default=str), encoding='utf-8')
+
+          def write_rows(path: Path, rows):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              rows = list(rows)
+              if not rows:
+                  path.write_text('', encoding='utf-8')
+                  return
+              keys = []
+              seen = set()
+              for r in rows:
+                  for k in r:
+                      if k not in seen:
+                          seen.add(k); keys.append(k)
+              with path.open('w', newline='', encoding='utf-8-sig') as f:
+                  w = csv.DictWriter(f, fieldnames=keys)
+                  w.writeheader(); w.writerows(rows)
+
+          def sha256_file(path: Path):
+              h=hashlib.sha256()
+              with path.open('rb') as f:
+                  for b in iter(lambda:f.read(1024*1024), b''):
+                      h.update(b)
+              return h.hexdigest()
+
+          def classify(exch, sym):
+              if exch == 'BJ': return 'BSE'
+              if exch == 'SH' and sym.startswith('688'): return 'STAR'
+              if exch == 'SZ' and (sym.startswith('300') or sym.startswith('301')): return 'CHINEXT'
+              if exch == 'SH': return 'SH_MAIN'
+              if exch == 'SZ': return 'SZ_MAIN'
+              return 'OTHER'
+
+          def localize_timestamp(s: pd.Series) -> pd.Series:
+              t = pd.to_datetime(s, errors='coerce')
+              try:
+                  if getattr(t.dt, 'tz', None) is not None:
+                      t = t.dt.tz_convert('Asia/Shanghai').dt.tz_localize(None)
+              except Exception:
+                  pass
+              return t
+
+          def read_target(path: Path):
+              schema_names = pq.ParquetFile(path).schema_arrow.names
+              miss=[c for c in PRICE_COLS if c not in schema_names]
+              if miss: raise ValueError(f'missing required fields: {miss}; have={schema_names}')
+              df = pd.read_parquet(path, columns=PRICE_COLS)
+              df['timestamp'] = localize_timestamp(df['timestamp'])
+              df = df[df['timestamp'].dt.year.eq(YEAR)].copy()
+              df = df.sort_values('timestamp').reset_index(drop=True)
+              return df
+
+          def minute_audit(exch, sym, board, remote, local, df):
+              r={'exchange':exch,'symbol':sym,'board':board,'remote_path':remote,
+                 'local_sha256':sha256_file(local),'rows_2023':int(len(df))}
+              if df.empty:
+                  r.update({'days_2023':0,'first_ts':'','last_ts':'','duplicate_ts':0})
+                  return r, None
+              r['first_ts']=str(df.timestamp.iloc[0]); r['last_ts']=str(df.timestamp.iloc[-1])
+              r['duplicate_ts']=int(df.timestamp.duplicated().sum())
+              r['days_2023']=int(df.timestamp.dt.date.nunique())
+              daycounts=df.groupby(df.timestamp.dt.date).size()
+              r['bars_per_day_min']=int(daycounts.min()); r['bars_per_day_med']=float(daycounts.median()); r['bars_per_day_max']=int(daycounts.max())
+              bad_ohlc=((df['high'] < df[['open','close','low']].max(axis=1)) | (df['low'] > df[['open','close','high']].min(axis=1))).sum()
+              r['bad_ohlc_rows']=int(bad_ohlc)
+              grid_err=0
+              for c in ['open','high','low','close']:
+                  vals=pd.to_numeric(df[c], errors='coerce').to_numpy(dtype=float)
+                  grid_err += int(np.sum(np.isfinite(vals) & (np.abs(vals*100-np.round(vals*100))>1e-4)))
+              r['price_grid_field_errors']=grid_err
+              r['negative_volume_rows']=int((pd.to_numeric(df.volume,errors='coerce')<0).sum())
+              r['zero_volume_rows']=int((pd.to_numeric(df.volume,errors='coerce')==0).sum())
+              # summarize timestamp-label semantics without assuming start/end labels
+              tm=df.timestamp.dt.strftime('%H:%M:%S')
+              r['first_time_mode']=str(df.groupby(df.timestamp.dt.date).first().timestamp.dt.strftime('%H:%M:%S').mode().iloc[0])
+              r['last_time_mode']=str(df.groupby(df.timestamp.dt.date).last().timestamp.dt.strftime('%H:%M:%S').mode().iloc[0])
+              common=Counter(tm).most_common(6)
+              r['most_common_clock_labels']=';'.join(f'{k}:{v}' for k,v in common)
+              daily=df.assign(date=df.timestamp.dt.date).groupby('date').agg(
+                  minute_open=('open','first'), minute_high=('high','max'), minute_low=('low','min'), minute_close=('close','last'), rows=('timestamp','size'), volume=('volume','sum')).reset_index()
+              daily['exchange']=exch; daily['symbol']=sym; daily['board']=board
+              return r, daily
+
+          def bs_result_to_df(rs):
+              fields=getattr(rs,'fields',[]) or []
+              rows=[]
+              while rs.error_code=='0' and rs.next(): rows.append(rs.get_row_data())
+              return pd.DataFrame(rows, columns=fields)
+
+          def baostock_bridge(selected):
+              out=[]; basics=[]; errors=[]; cal=pd.DataFrame()
+              try:
+                  import baostock as bs
+              except Exception as e:
+                  return out, basics, errors+[{'stage':'import','error':repr(e)}], cal
+              lg=bs.login()
+              if lg.error_code!='0':
+                  errors.append({'stage':'login','code':lg.error_code,'msg':lg.error_msg}); return out,basics,errors,cal
+              try:
+                  cal=bs_result_to_df(bs.query_trade_dates(start_date=f'{YEAR}-01-01',end_date=f'{YEAR}-12-31'))
+                  for item in selected:
+                      exch,sym,board=item['exchange'],item['symbol'],item['board']
+                      code=('sh.' if exch=='SH' else 'sz.' if exch=='SZ' else 'bj.')+sym
+                      try:
+                          rb=bs.query_stock_basic(code=code)
+                          bdf=bs_result_to_df(rb)
+                          if not bdf.empty:
+                              rec=bdf.iloc[0].to_dict(); rec.update({'exchange':exch,'symbol':sym,'board':board}); basics.append(rec)
+                          fields='date,code,open,high,low,close,preclose,volume,amount,adjustflag,turn,tradestatus,pctChg,isST'
+                          rd=bs.query_history_k_data_plus(code,fields,start_date=f'{YEAR}-01-01',end_date=f'{YEAR}-12-31',frequency='d',adjustflag='3')
+                          ddf=bs_result_to_df(rd)
+                          if ddf.empty:
+                              errors.append({'stage':'daily','code':code,'board':board,'error_code':rd.error_code,'error_msg':rd.error_msg,'status':'NO_ROWS_OR_UNSUPPORTED'})
+                              continue
+                          ddf['exchange']=exch; ddf['symbol']=sym; ddf['board']=board
+                          out.extend(ddf.to_dict('records'))
+                      except Exception as e:
+                          errors.append({'stage':'symbol','code':code,'board':board,'error':repr(e)})
+              finally:
+                  try: bs.logout()
+                  except Exception: pass
+              return out, basics, errors, cal
+
+          def d2(x):
+              return Decimal(str(x)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+          def limit_pct(board):
+              return {'SH_MAIN':Decimal('0.10'),'SZ_MAIN':Decimal('0.10'),'CHINEXT':Decimal('0.20'),'STAR':Decimal('0.20'),'BSE':Decimal('0.30')}[board]
+
+          def make_limit_bridge(minute_daily, bs_daily, basics, cal):
+              if minute_daily.empty or bs_daily.empty: return pd.DataFrame(), pd.DataFrame()
+              b=bs_daily.copy()
+              for c in ['open','high','low','close','preclose']:
+                  b[c]=pd.to_numeric(b[c],errors='coerce')
+              b['tradestatus']=pd.to_numeric(b['tradestatus'],errors='coerce')
+              b['isST']=pd.to_numeric(b['isST'],errors='coerce')
+              b['date']=pd.to_datetime(b['date'],errors='coerce').dt.date
+              m=minute_daily.copy(); m['date']=pd.to_datetime(m['date']).dt.date
+              z=m.merge(b[['date','exchange','symbol','board','preclose','open','high','low','close','tradestatus','isST']],on=['date','exchange','symbol','board'],how='left',suffixes=('','_bs'))
+              basic_map={(str(x.get('exchange')),str(x.get('symbol'))):x for x in basics}
+              cal_dates=[]
+              if cal is not None and not cal.empty and 'calendar_date' in cal.columns and 'is_trading_day' in cal.columns:
+                  cal_dates=sorted(pd.to_datetime(cal.loc[cal['is_trading_day'].astype(str).eq('1'),'calendar_date'],errors='coerce').dropna().dt.date.tolist())
+              records=[]
+              for _,r in z.iterrows():
+                  rec=r.to_dict(); board=r['board']; pre=r.get('preclose')
+                  rec['daily_ref_available']=bool(pd.notna(pre) and float(pre)>0)
+                  rec['eligible_basic']=bool(rec['daily_ref_available'] and r.get('tradestatus')==1 and r.get('isST')==0)
+                  key=(str(r['exchange']),str(r['symbol'])); br=basic_map.get(key,{})
+                  rec['ipoDate']=br.get('ipoDate',''); rec['outDate']=br.get('outDate','')
+                  # Conservative unresolved-name guard: if delisted during target year, do not certify this stock in pilot.
+                  outdate=str(rec['outDate'] or '')
+                  rec['delist_name_unresolved']=bool(outdate.startswith(str(YEAR)))
+                  ipodate=str(rec['ipoDate'] or '')
+                  rec['ipo_no_limit_window']=False
+                  rec['ipo_trading_day_number']=None
+                  try:
+                      ipo_dt=pd.to_datetime(ipodate).date() if ipodate else None
+                      cur_dt=r['date']
+                      if ipo_dt and cur_dt>=ipo_dt and cal_dates:
+                          post=[d for d in cal_dates if d>=ipo_dt and d<=cur_dt]
+                          nday=len(post)
+                          rec['ipo_trading_day_number']=nday
+                          if board in ('STAR','CHINEXT'):
+                              n_no=5
+                          elif board=='BSE':
+                              n_no=1
+                          elif board in ('SH_MAIN','SZ_MAIN'):
+                              n_no=5 if ipo_dt>=pd.to_datetime('2023-04-10').date() else 1
+                          else:
+                              n_no=0
+                          rec['ipo_no_limit_window']=bool(1<=nday<=n_no)
+                  except Exception:
+                      rec['ipo_no_limit_window']=False
+                  rec['eligible_for_limit_audit']=bool(rec['eligible_basic'] and not rec['delist_name_unresolved'] and not rec['ipo_no_limit_window'])
+                  if rec['eligible_for_limit_audit']:
+                      p=limit_pct(board); preD=Decimal(str(pre))
+                      up=(preD*(Decimal('1')+p)).quantize(Decimal('0.01'),rounding=ROUND_HALF_UP)
+                      dn=(preD*(Decimal('1')-p)).quantize(Decimal('0.01'),rounding=ROUND_HALF_UP)
+                      rec['calc_up_limit']=float(up); rec['calc_down_limit']=float(dn)
+                      rec['minute_above_calc_up']=bool(float(r['minute_high'])>float(up)+1e-8)
+                      rec['minute_below_calc_down']=bool(float(r['minute_low'])<float(dn)-1e-8)
+                      rec['limit_breach']=bool(rec['minute_above_calc_up'] or rec['minute_below_calc_down'])
+                  else:
+                      rec['calc_up_limit']=np.nan; rec['calc_down_limit']=np.nan
+                      rec['minute_above_calc_up']=False; rec['minute_below_calc_down']=False; rec['limit_breach']=False
+                  records.append(rec)
+              out=pd.DataFrame(records)
+              breaches=out[out['limit_breach'].eq(True)].copy() if 'limit_breach' in out else pd.DataFrame()
+              return out,breaches
+
+          def main():
+              OUT.mkdir(parents=True,exist_ok=True); CACHE.mkdir(exist_ok=True)
+              meta={}
+              api=HfApi()
+              info=api.dataset_info(REPO)
+              sha=str(info.sha)
+              if not re.fullmatch(r'[0-9a-fA-F]{40}',sha): raise RuntimeError(f'noncanonical dataset sha: {sha}')
+              files=list(api.list_repo_files(REPO,repo_type='dataset',revision=sha))
+              rx=re.compile(r'^data/stock_1m/(SH|SZ|BJ)/(\d{6})\.parquet$')
+              inv=[]; byboard=defaultdict(list)
+              for f in files:
+                  m=rx.match(f)
+                  if not m: continue
+                  exch,sym=m.groups(); board=classify(exch,sym)
+                  rec={'path':f,'exchange':exch,'symbol':sym,'board':board}; inv.append(rec); byboard[board].append(rec)
+              for b in byboard:
+                  byboard[b]=sorted(byboard[b], key=lambda x:hashlib.sha256(x['path'].encode()).hexdigest())
+              meta={'repo':REPO,'revision_sha':sha,'security_files':len(inv),'board_inventory':{b:len(byboard.get(b,[])) for b in BOARDS}}
+              jdump(OUT/'dataset_lock.json',meta); write_rows(OUT/'inventory.csv',inv)
+
+              selected=[]; coverage=[]; minute_daily_parts=[]; semantics_samples=[]
+              for board in BOARDS:
+                  got=0; scanned=0
+                  for rec in byboard.get(board,[]):
+                      if got>=N_PER_BOARD or scanned>=MAX_SCAN_PER_BOARD: break
+                      scanned+=1
+                      row=dict(rec)
+                      try:
+                          local=Path(hf_hub_download(repo_id=REPO,filename=rec['path'],repo_type='dataset',revision=sha,cache_dir=str(CACHE)))
+                          df=read_target(local)
+                          aud,daily=minute_audit(rec['exchange'],rec['symbol'],board,rec['path'],local,df)
+                          row.update(aud); row['download_status']='OK'
+                          if not df.empty:
+                              selected.append(rec); got+=1
+                              minute_daily_parts.append(daily)
+                              # bounded timestamp semantics evidence: first/last 5 rows of first selected file per board
+                              if got==1:
+                                  samp=pd.concat([df.head(5),df.tail(5)]).copy()
+                                  for rr in samp.to_dict('records'):
+                                      semantics_samples.append({'board':board,'exchange':rec['exchange'],'symbol':rec['symbol'],**rr})
+                      except Exception as e:
+                          row.update({'download_status':'ERROR','error':repr(e),'rows_2023':None})
+                      coverage.append(row)
+                  coverage.append({'board':board,'download_status':'BOARD_SUMMARY','selected_active_2023':got,'scanned_candidates':scanned})
+              write_rows(OUT/'minute_coverage.csv',coverage); write_rows(OUT/'selected_pilot.csv',selected); write_rows(OUT/'minute_label_samples.csv',semantics_samples)
+              minute_daily=pd.concat(minute_daily_parts,ignore_index=True) if minute_daily_parts else pd.DataFrame()
+              if not minute_daily.empty: minute_daily.to_csv(OUT/'minute_daily_aggregate.csv',index=False,encoding='utf-8-sig')
+
+              bs_rows,basics,bs_errors,cal=baostock_bridge(selected)
+              write_rows(OUT/'baostock_daily.csv',bs_rows); write_rows(OUT/'baostock_basic.csv',basics); write_rows(OUT/'baostock_errors.csv',bs_errors)
+              if not cal.empty: cal.to_csv(OUT/'baostock_trade_calendar.csv',index=False,encoding='utf-8-sig')
+              bs_daily=pd.DataFrame(bs_rows)
+              bridge,breaches=make_limit_bridge(minute_daily,bs_daily,basics,cal)
+              if not bridge.empty: bridge.to_csv(OUT/'price_limit_bridge.csv',index=False,encoding='utf-8-sig')
+              if not breaches.empty: breaches.to_csv(OUT/'price_limit_breaches.csv',index=False,encoding='utf-8-sig')
+              else: (OUT/'price_limit_breaches.csv').write_text('',encoding='utf-8')
+
+              summaries=[]
+              for board in BOARDS:
+                  cov=[x for x in coverage if x.get('board')==board and x.get('download_status')=='OK' and (x.get('rows_2023') or 0)>0]
+                  br=bridge[bridge.board.eq(board)] if not bridge.empty else pd.DataFrame()
+                  summaries.append({
+                      'board':board,
+                      'selected_files_with_2023':len(cov),
+                      'rows_2023_sum':sum(int(x.get('rows_2023') or 0) for x in cov),
+                      'daily_bridge_rows':int(len(br)) if not br.empty else 0,
+                      'eligible_limit_audit_days':int(br.eligible_for_limit_audit.sum()) if (not br.empty and 'eligible_for_limit_audit' in br) else 0,
+                      'limit_breach_days':int(br.limit_breach.sum()) if (not br.empty and 'limit_breach' in br) else 0,
+                  })
+              write_rows(OUT/'board_summary.csv',summaries)
+              trading_days=None
+              if not cal.empty and 'is_trading_day' in cal:
+                  trading_days=int((cal['is_trading_day'].astype(str)=='1').sum())
+              state={
+                  'status':'PHASE2_DATA_BRIDGE_ONLY_NOT_BACKTEST',
+                  'dataset_sha':sha,
+                  'inventory_files':len(inv),
+                  'selected_pilot_files':len(selected),
+                  'baostock_daily_rows':len(bs_rows),
+                  'baostock_error_rows':len(bs_errors),
+                  'trade_calendar_days':trading_days,
+                  'limit_bridge_rows':int(len(bridge)),
+                  'limit_breach_rows':int(len(breaches)),
+                  'strategy_statistics_emitted':False,
+                  'notes':[
+                      'No strategy return/win-rate/CAGR is computed in Phase2.',
+                      'ST days are excluded from candidate limit audit because the frozen R5B name filter excludes ST.',
+                      'IPO no-limit windows are excluded from candidate limit audit: STAR/ChiNext first 5 trading days, BSE first day, and main-board first 5 trading days for IPOs from 2023-04-10 (pre-reform main-board first day only).',
+                      'Days for stocks with 2023 delisting date are not certified here because historical name containing 退 is unresolved.',
+                      'Computed limits are a candidate bridge and are rejected on any minute-price breach; corporate-action reference-price semantics still require review.',
+                      'Minute timestamps are summarized, not assumed to be start- or end-labelled.'
+                  ]
+              }
+              jdump(OUT/'SUMMARY.json',state)
+              report=['# R5B Phase2 — 2023 PIT / price-basis bridge','',
+                      '**Not a backtest. No trade permission.**','',
+                      f"- Dataset SHA: `{sha}`",f"- Security files in pinned inventory: {len(inv)}",f"- Selected active-2023 pilot files: {len(selected)}",f"- BaoStock daily rows: {len(bs_rows)}",f"- Candidate limit bridge rows: {len(bridge)}",f"- Candidate-limit breach rows: {len(breaches)}",'','## Board summary','']
+              report.append('|Board|Selected|2023 rows|Daily bridge|Eligible limit-audit days|Breach days|')
+              report.append('|---|---:|---:|---:|---:|---:|')
+              for x in summaries:
+                  report.append(f"|{x['board']}|{x['selected_files_with_2023']}|{x['rows_2023_sum']}|{x['daily_bridge_rows']}|{x['eligible_limit_audit_days']}|{x['limit_breach_days']}|")
+              report += ['','A green job means the bounded acquisition/audit program ended. Phase3 backtesting starts only after timestamp and daily-reference anomalies are reviewed.']
+              (OUT/'REPORT.md').write_text('\n'.join(report),encoding='utf-8')
+
+              # Manifest last
+              manifest={}
+              for p in sorted(OUT.rglob('*')):
+                  if p.is_file() and p.name!='MANIFEST_SHA256.json': manifest[str(p.relative_to(OUT))]=sha256_file(p)
+              jdump(OUT/'MANIFEST_SHA256.json',manifest)
+              print((OUT/'REPORT.md').read_text(encoding='utf-8'))
+
+          if __name__=='__main__':
+              try: main()
+              except Exception:
+                  OUT.mkdir(parents=True,exist_ok=True)
+                  (OUT/'FATAL_ERROR.txt').write_text(traceback.format_exc(),encoding='utf-8')
+                  raise
+          PY
+          python -m py_compile r5b_phase2.py
+          sha256sum r5b_phase2.py > R5B_PHASE2_SOURCE_SHA256.txt
+
+      - name: Run bounded 2023 PIT / price-basis bridge
+        shell: bash
+        timeout-minutes: 45
+        run: |
+          set -euo pipefail
+          python r5b_phase2.py 2>&1 | tee phase2_run.log
+
+      - name: Preserve program and logs
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          mkdir -p r5b_phase2_results
+          cp r5b_phase2.py r5b_phase2_results/SOURCE_USED.py || true
+          cp R5B_PHASE2_SOURCE_SHA256.txt r5b_phase2_results/SOURCE_SHA256.txt || true
+          cp phase2_run.log r5b_phase2_results/run.log || true
+          if [ -f r5b_phase2_results/REPORT.md ]; then cat r5b_phase2_results/REPORT.md >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - name: Upload Phase2 evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: R5B-PHASE2-PIT-BRIDGE-${{ github.run_id }}
+          path: r5b_phase2_results/
+          retention-days: 3
+          compression-level: 6
+          if-no-files-found: error
