@@ -1,0 +1,93 @@
+name: PORT R25 无损证据回传
+run-name: PORT-R25 source ${{ inputs.source_run_id }}
+"on":
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: "已有R24运行编号（不是COMPACT运行编号）"
+        required: true
+        default: "35368288514"
+        type: string
+      source_artifact:
+        description: "已有R24 FINAL名称"
+        required: true
+        default: "PORT-R24-FINAL-35368288514-1"
+        type: string
+permissions:
+  actions: read
+  contents: read
+concurrency:
+  group: port-r25-${{ github.repository }}-${{ inputs.source_run_id }}
+  cancel-in-progress: false
+jobs:
+  evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      SOURCE_ARTIFACT: ${{ inputs.source_artifact }}
+      SOURCE_REPOSITORY: ${{ github.repository }}
+    steps:
+      - name: 准备并验证内置程序
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p r25_exports
+          python3 - <<'PYCODE'
+          import os,re,base64,gzip,hashlib
+          from pathlib import Path
+          assert re.fullmatch(r"[0-9]+",os.environ["SOURCE_RUN_ID"]), "INVALID_RUN_ID"
+          assert re.fullmatch(r"PORT-R24-FINAL-[0-9]+-[0-9]+",os.environ["SOURCE_ARTIFACT"]), "INVALID_ARTIFACT_NAME"
+          code=gzip.decompress(base64.b64decode("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"))
+          assert hashlib.sha256(code).hexdigest()=="89f17028fab421eddd0254a2058be3cd883e33dadcf48e98b58cd6354a14b187"
+          compile(code,"export_evidence.py","exec")
+          Path("export_evidence.py").write_bytes(code)
+          PYCODE
+          python3 export_evidence.py --selftest
+      - name: 仅下载已有FINAL，不重跑市场采集
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p source_artifact
+          gh run download "$SOURCE_RUN_ID" --repo "$SOURCE_REPOSITORY" --name "$SOURCE_ARTIFACT" --dir source_artifact
+      - name: 全文无损导出及原PDF哈希复核
+        id: pack
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 export_evidence.py --source source_artifact --out r25_exports 2>&1 | tee r25_exports/EXPORT_RUN.log
+      - name: 展示结果，先上传INDEX再上传小包
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PYCODE'
+          import json,os
+          from pathlib import Path
+          p=Path("r25_exports/SUMMARY.json")
+          lines=["# PORT-R25 无损证据回传","只整理已有R24，不重新采集、不训练、不下单。"]
+          if p.exists():
+              d=json.loads(p.read_text())
+              for k in ["full_text_json_files","full_text_pages","PDF_original_files_hash_checked","small_original_PDFs_included","export_failures"]:
+                  lines.append(f"- {k}: {d[k]}")
+              lines.append("先传 PORT-R25-INDEX-01.zip；再传EVIDENCE与PDF-REVIEW。每个ZIP独立完整，设计上限48 MiB。")
+          else: lines.append("没有生成SUMMARY：查看下载/程序日志。不是0条合格数据。")
+          Path(os.environ["GITHUB_STEP_SUMMARY"]).write_text("\n".join(lines))
+          PYCODE
+      - name: 上传可单独发送的小包与诊断
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: PORT-R25-RETURN-${{ inputs.source_run_id }}-${{ github.run_attempt }}
+          path: r25_exports/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+      - name: 保留真实导出失败状态
+        if: steps.pack.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "导出有缺口。已有小包和日志已先上传，请查看INDEX/export_failures.json，不需要重跑R24。"
+          exit 2
