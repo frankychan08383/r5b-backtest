@@ -1,0 +1,240 @@
+name: PORT-R24 Compact Distill
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: "R24 source GitHub Actions run ID"
+        required: true
+        default: "35368288514"
+        type: string
+      source_artifact:
+        description: "R24 FINAL artifact name"
+        required: true
+        default: "PORT-R24-FINAL-35368288514-1"
+        type: string
+      max_text_hits:
+        description: "Maximum PIT text evidence hits"
+        required: true
+        default: "50000"
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  compact:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Show source
+        run: |
+          echo "source_run_id=${{ inputs.source_run_id }}"
+          echo "source_artifact=${{ inputs.source_artifact }}"
+
+      - name: Download R24 FINAL from GitHub artifact storage
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p source_artifact
+          gh run download "${{ inputs.source_run_id }}" \
+            --repo "${{ github.repository }}" \
+            --name "${{ inputs.source_artifact }}" \
+            --dir source_artifact
+
+      - name: Build compact evidence and backtest-input package
+        env:
+          MAX_TEXT_HITS: ${{ inputs.max_text_hits }}
+        shell: bash
+        run: |
+          cat > /tmp/distill_r24.py <<'PY'
+          import csv, gzip, hashlib, json, os, re, shutil, zipfile
+          from pathlib import Path
+          from collections import Counter, defaultdict
+
+          SRC = Path("source_artifact")
+          WORK = Path("r24_expanded")
+          OUT = Path("r24_compact")
+          OUT.mkdir(parents=True, exist_ok=True)
+          WORK.mkdir(parents=True, exist_ok=True)
+          MAX_TEXT_HITS = int(os.environ.get("MAX_TEXT_HITS", "50000"))
+          KEY_BASENAMES = {
+              "coverage.csv", "filings_index.csv", "PIT_REVIEW_QUEUE.csv",
+              "daily_price_candidates.csv", "corporate_action_candidates.csv",
+              "MANIFEST_SHA256.json", "manifest.json", "summary.json",
+              "status.json", "run_summary.json"
+          }
+
+          def sha256_file(p, chunk=1024*1024):
+              h = hashlib.sha256()
+              with p.open("rb") as f:
+                  for b in iter(lambda: f.read(chunk), b""):
+                      h.update(b)
+              return h.hexdigest()
+
+          def safe_extract(zpath, dest):
+              with zipfile.ZipFile(zpath) as z:
+                  root = dest.resolve()
+                  for member in z.infolist():
+                      target = (dest / member.filename).resolve()
+                      if not str(target).startswith(str(root)):
+                          raise RuntimeError(f"unsafe zip path: {member.filename}")
+                  z.extractall(dest)
+
+          copied = 0
+          for p in SRC.rglob("*"):
+              if p.is_file():
+                  rel = p.relative_to(SRC)
+                  dest = WORK / rel
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(p, dest)
+                  copied += 1
+
+          for _ in range(2):
+              new_count = 0
+              for z in list(WORK.rglob("*.zip")):
+                  marker = z.with_suffix(z.suffix + ".expanded")
+                  if marker.exists():
+                      continue
+                  dest = z.parent / (z.stem + "_unzipped")
+                  try:
+                      safe_extract(z, dest)
+                      marker.write_text("ok\n", encoding="utf-8")
+                      new_count += 1
+                  except Exception as e:
+                      marker.write_text(f"ERROR {e}\n", encoding="utf-8")
+              if not new_count:
+                  break
+
+          all_files = [p for p in WORK.rglob("*") if p.is_file() and not p.name.endswith(".expanded")]
+          basename_map = defaultdict(list)
+          for p in all_files:
+              basename_map[p.name].append(p)
+
+          key_dir = OUT / "key_files"
+          key_dir.mkdir(exist_ok=True)
+          key_index = []
+          for base in sorted(KEY_BASENAMES):
+              for i, src in enumerate(basename_map.get(base, [])):
+                  suffix = "" if i == 0 else f"__dup{i}"
+                  dst = key_dir / (src.stem + suffix + src.suffix)
+                  shutil.copy2(src, dst)
+                  key_index.append({
+                      "basename": base,
+                      "source_path": str(src.relative_to(WORK)),
+                      "compact_path": str(dst.relative_to(OUT)),
+                      "bytes": src.stat().st_size,
+                      "sha256": sha256_file(src),
+                  })
+
+          pdf_rows = []
+          for p in all_files:
+              if p.suffix.lower() == ".pdf":
+                  pdf_rows.append({"path": str(p.relative_to(WORK)), "bytes": p.stat().st_size, "sha256": sha256_file(p)})
+          with (OUT / "pdf_manifest.csv").open("w", encoding="utf-8-sig", newline="") as f:
+              w = csv.DictWriter(f, fieldnames=["path","bytes","sha256"])
+              w.writeheader(); w.writerows(pdf_rows)
+
+          ext_counts = Counter()
+          total_bytes = 0
+          failure_rows = []
+          for p in all_files:
+              ext_counts[p.suffix.lower() or "<none>"] += 1
+              total_bytes += p.stat().st_size
+              low = p.name.lower()
+              if any(k in low for k in ["fail","error","warning","status","coverage"]) and p.stat().st_size <= 2_000_000:
+                  try:
+                      txt = p.read_text(encoding="utf-8", errors="replace")
+                      failure_rows.append({"path": str(p.relative_to(WORK)), "bytes": p.stat().st_size, "snippet": txt[:4000].replace("\x00","")})
+                  except Exception:
+                      pass
+          with (OUT / "failure_and_status_snippets.csv").open("w", encoding="utf-8-sig", newline="") as f:
+              w = csv.DictWriter(f, fieldnames=["path","bytes","snippet"])
+              w.writeheader(); w.writerows(failure_rows)
+
+          pat = re.compile(
+              r"(每股收益|基本每股收益|稀释每股收益|营业收入|归母净利润|净利润|现金流量表|经营活动产生的现金流量|资本支出|股本|股份数|加权平均股数|列报币种|记账本位币|功能货币|presentation currency|functional currency|earnings per share|weighted average number of shares|share capital|restated|重述|公告日期|披露日期|退市|撤回上市|delist|withdrawal|dividend|股息|派息|送股|转增|配股|rights issue)", re.I)
+          text_exts = {".txt",".md",".json",".jsonl",".csv",".tsv",".html",".htm",".xml"}
+          hit_rows = []
+          seen = set()
+          for p in all_files:
+              if len(hit_rows) >= MAX_TEXT_HITS: break
+              if p.suffix.lower() not in text_exts or p.stat().st_size > 20_000_000: continue
+              try: txt = p.read_text(encoding="utf-8", errors="replace")
+              except Exception: continue
+              for lineno, line in enumerate(txt.splitlines(), 1):
+                  if len(hit_rows) >= MAX_TEXT_HITS: break
+                  if pat.search(line):
+                      key = (str(p.relative_to(WORK)), lineno, line[:300])
+                      if key in seen: continue
+                      seen.add(key)
+                      hit_rows.append({"path": key[0], "line": lineno, "text": line[:1600].replace("\x00","")})
+          with gzip.open(OUT / "pit_text_hits.csv.gz", "wt", encoding="utf-8-sig", newline="") as f:
+              w = csv.DictWriter(f, fieldnames=["path","line","text"])
+              w.writeheader(); w.writerows(hit_rows)
+
+          compressed_key = []
+          for base in ["daily_price_candidates.csv","corporate_action_candidates.csv","filings_index.csv","PIT_REVIEW_QUEUE.csv","coverage.csv"]:
+              for src in basename_map.get(base, []):
+                  tag = hashlib.sha1(str(src).encode()).hexdigest()[:8] if len(basename_map.get(base, [])) > 1 else ""
+                  out_name = f"{src.stem}{'__'+tag if tag else ''}{src.suffix}.gz"
+                  dst = OUT / out_name
+                  with src.open("rb") as fin, gzip.open(dst, "wb", compresslevel=9) as fout:
+                      shutil.copyfileobj(fin, fout)
+                  compressed_key.append({"source": str(src.relative_to(WORK)), "output": dst.name, "raw_bytes": src.stat().st_size, "gzip_bytes": dst.stat().st_size, "sha256_raw": sha256_file(src)})
+
+          summary = {
+              "source_files_copied": copied,
+              "expanded_file_count": len(all_files),
+              "expanded_total_bytes": total_bytes,
+              "pdf_count": len(pdf_rows),
+              "pit_text_hits": len(hit_rows),
+              "failure_status_files": len(failure_rows),
+              "extension_counts": dict(sorted(ext_counts.items())),
+              "key_files": key_index,
+              "compressed_key_files": compressed_key,
+              "notes": [
+                  "No raw PDF bytes are included in the compact artifact.",
+                  "PDF SHA256/path/size are retained in pdf_manifest.csv.",
+                  "Price/action/PIT index tables are preserved as gzip CSV.",
+                  "PIT text hits are evidence candidates only; they do not certify PIT by themselves.",
+                  "Missing data are never converted to zero."
+              ]
+          }
+          (OUT / "compact_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+          (OUT / "README.md").write_text(
+              "# PORT-R24 COMPACT\n\n"
+              "Upload the single PORT-R24-COMPACT.zip back to ChatGPT.\n"
+              "Do not upload the original 1.94GB FINAL or the eight SHARD artifacts.\n\n"
+              f"PDFs indexed: {len(pdf_rows)}\nPIT text hits: {len(hit_rows)}\n",
+              encoding="utf-8")
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+          PY
+
+          python /tmp/distill_r24.py
+          python - <<'PY'
+          from pathlib import Path
+          import zipfile
+          src = Path("r24_compact")
+          out = Path("PORT-R24-COMPACT.zip")
+          with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+              for p in sorted(src.rglob("*")):
+                  if p.is_file(): z.write(p, p.relative_to(src))
+          print(f"{out}: {out.stat().st_size/1024/1024:.2f} MiB")
+          PY
+
+      - name: Show compact summary
+        run: |
+          cat r24_compact/compact_summary.json
+          echo
+          ls -lh PORT-R24-COMPACT.zip
+
+      - name: Upload compact artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PORT-R24-COMPACT-${{ inputs.source_run_id }}
+          path: PORT-R24-COMPACT.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
